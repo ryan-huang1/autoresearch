@@ -12,6 +12,7 @@ Data and split metadata are stored in ~/.cache/autoresearch/.
 
 import argparse
 import os
+import sys
 
 import torch
 import torch.nn.functional as F
@@ -58,13 +59,66 @@ CLASS_NAMES = (
 )
 
 
+def is_mps_available():
+    return hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+
+
+def get_default_device():
+    if is_mps_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
 def _resolve_device(device=None):
     if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        return get_default_device()
+    if isinstance(device, torch.device):
+        return device
     return torch.device(device)
 
 
+def get_device_name(device=None):
+    return _resolve_device(device).type
+
+
+def _supports_non_blocking(device):
+    return _resolve_device(device).type == "cuda"
+
+
+def synchronize_device(device=None):
+    device = _resolve_device(device)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elif device.type == "mps" and hasattr(torch, "mps") and hasattr(torch.mps, "synchronize"):
+        torch.mps.synchronize()
+
+
+def reset_peak_memory_stats(device=None):
+    device = _resolve_device(device)
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+
+
+def get_peak_memory_mb(device=None):
+    device = _resolve_device(device)
+    if device.type == "cuda":
+        return torch.cuda.max_memory_allocated(device) / 1024 / 1024
+    if device.type == "mps" and hasattr(torch, "mps"):
+        try:
+            if hasattr(torch.mps, "driver_allocated_memory"):
+                return torch.mps.driver_allocated_memory() / 1024 / 1024
+            if hasattr(torch.mps, "current_allocated_memory"):
+                return torch.mps.current_allocated_memory() / 1024 / 1024
+        except RuntimeError:
+            return 0.0
+    return 0.0
+
+
 def _resolve_num_workers():
+    if sys.platform == "darwin":
+        # macOS uses spawn semantics, so a conservative default avoids worker
+        # process issues during local experimentation.
+        return 0
     cpu_count = os.cpu_count() or 1
     return min(8, max(1, cpu_count // 2))
 
@@ -180,16 +234,17 @@ def build_dataset(split, augment=False):
     return dataset
 
 
-def _make_epoch_loader(split, batch_size, augment=False):
+def _make_epoch_loader(split, batch_size, augment=False, device=None):
     dataset = build_dataset(split, augment=augment)
     num_workers = _resolve_num_workers()
+    device = _resolve_device(device)
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=(split == "train"),
         drop_last=(split == "train"),
         num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=device.type == "cuda",
         persistent_workers=num_workers > 0,
     )
 
@@ -204,12 +259,13 @@ def make_dataloader(batch_size, split, augment=False, device=None):
     assert split in {"train", "val", "test"}
     device = _resolve_device(device)
     epoch = 1
-    loader = _make_epoch_loader(split, batch_size, augment=augment and split == "train")
+    non_blocking = _supports_non_blocking(device)
+    loader = _make_epoch_loader(split, batch_size, augment=augment and split == "train", device=device)
 
     while True:
         for images, labels in loader:
-            images = images.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
+            images = images.to(device, non_blocking=non_blocking)
+            labels = labels.to(device, non_blocking=non_blocking)
             yield images, labels, epoch
         epoch += 1
 
@@ -230,7 +286,8 @@ def evaluate_classifier(model, batch_size, split="val", device=None):
     """
     assert split in {"val", "test"}
     device = _resolve_device(device)
-    loader = _make_epoch_loader(split, batch_size, augment=False)
+    non_blocking = _supports_non_blocking(device)
+    loader = _make_epoch_loader(split, batch_size, augment=False, device=device)
 
     was_training = model.training
     model.eval()
@@ -240,8 +297,8 @@ def evaluate_classifier(model, batch_size, split="val", device=None):
     total_examples = 0
 
     for images, labels in loader:
-        images = images.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
+        images = images.to(device, non_blocking=non_blocking)
+        labels = labels.to(device, non_blocking=non_blocking)
         logits = model(images)
         total_loss += F.cross_entropy(logits, labels, reduction="sum").item()
         total_correct += (logits.argmax(dim=1) == labels).sum().item()

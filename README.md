@@ -16,7 +16,7 @@ By design, training runs for a **fixed 5-minute time budget** (wall clock traini
 
 ## Quick start
 
-**Requirements:** A single NVIDIA GPU, Python 3.10+, and [uv](https://docs.astral.sh/uv/).
+**Requirements:** A Mac with Python 3.10+ and [uv](https://docs.astral.sh/uv/). Apple Silicon with `mps` is the primary target, and CPU fallback is supported for slower smoke-test runs.
 
 ```bash
 # 1. Install dependencies
@@ -56,7 +56,7 @@ pyproject.toml   dependencies
 - **Single file to modify.** The agent only edits `train.py`, which keeps diffs small and reviewable.
 - **Fixed time budget.** Every experiment gets the same 5-minute wall clock budget, so architecture and optimization changes are compared under the same constraint.
 - **Fixed split and metric.** `prepare.py` defines the deterministic train/validation split and evaluation harness so experiments do not silently drift onto a different target.
-- **Small, self-contained setup.** One dataset, one GPU, one editable training script, one scoreboard.
+- **Small, self-contained setup.** One dataset, one local device, one editable training script, one scoreboard.
 
 ## Current baseline
 
@@ -65,7 +65,7 @@ The baseline in `train.py` is a compact ResNet-style image classifier for 32x32 
 - GroupNorm-based residual blocks
 - Standard CIFAR-10 augmentation from the fixed harness
 - SGD with momentum
-- Mixed precision on CUDA
+- Mac-first execution on `mps` when available, with CPU fallback
 - A fixed-time training loop with gradient accumulation
 
 The baseline is intentionally simple so the autonomous loop can explore improvements in architecture, optimization, and schedule from a clean starting point.
@@ -76,7 +76,7 @@ The baseline is intentionally simple so the autonomous loop can explore improvem
 
 ## Platform support
 
-This repo is currently GPU-first and assumes a single NVIDIA CUDA device. The harness and training loop are kept intentionally narrow so the experiment cycle stays fast and easy to reason about.
+This repo is Mac-first. On Apple Silicon it prefers the `mps` backend; on other Macs it falls back to CPU. The training harness is intentionally conservative on macOS: DataLoader workers default to a safer local setup, and the baseline runs in full precision on Mac for stability.
 
 ## License
 

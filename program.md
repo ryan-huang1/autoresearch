@@ -20,7 +20,7 @@ Once you get confirmation, kick off the experimentation.
 
 ## Experimentation
 
-Each experiment runs on a single GPU. The training script runs for a **fixed time budget of 5 minutes** (wall clock training time, excluding startup/compilation overhead). You launch it simply as:
+Each experiment runs on a single local device. On Macs, `train.py` prefers Apple Silicon `mps` and falls back to CPU when needed. The training script runs for a **fixed time budget of 5 minutes** (wall clock training time, excluding startup/compilation overhead). You launch it simply as:
 
 `uv run train.py`
 
@@ -37,7 +37,7 @@ Each experiment runs on a single GPU. The training script runs for a **fixed tim
 
 **Tie-breaker**: If two experiments have effectively the same `val_acc`, prefer the lower `val_loss`. If that is also similar, prefer the simpler implementation.
 
-**VRAM** is a soft constraint. Some increase is acceptable for a meaningful accuracy gain, but it should not blow up dramatically.
+**Memory** is a soft constraint. Some increase is acceptable for a meaningful accuracy gain, but it should not blow up dramatically.
 
 **Simplicity criterion**: All else being equal, simpler is better. A tiny gain that adds ugly complexity is not worth it. Conversely, removing code and getting equal or better accuracy is a win.
 
@@ -49,11 +49,12 @@ Once the script finishes it prints a summary like this:
 
 ```text
 ---
+device:           mps
 val_acc:          0.842600
 val_loss:         0.505300
 training_seconds: 300.0
 total_seconds:    313.4
-peak_vram_mb:     1820.5
+peak_memory_mb:   1820.5
 images_per_sec:   24750.2
 total_images_k:   3072.0
 num_steps:        3000
@@ -64,7 +65,7 @@ depth:            2
 You can extract the key metrics from the log file with:
 
 ```bash
-rg "^(val_acc|val_loss|peak_vram_mb):" run.log
+rg "^(device|val_acc|val_loss|peak_memory_mb):" run.log
 ```
 
 ## Logging results
@@ -79,7 +80,7 @@ commit	val_acc	memory_gb	status	description
 
 1. git commit hash (short, 7 chars)
 2. `val_acc` achieved (for example `0.842600`) — use `0.000000` for crashes
-3. peak memory in GB, round to one decimal place (divide `peak_vram_mb` by 1024) — use `0.0` for crashes
+3. sampled backend-reported peak memory in GB, round to one decimal place (divide `peak_memory_mb` by 1024) — use `0.0` for crashes
 4. status: `keep`, `discard`, or `crash`
 5. short text description of what this experiment tried
 
@@ -103,12 +104,12 @@ LOOP FOREVER:
 2. Tune `train.py` with one experimental idea.
 3. Git commit.
 4. Run the experiment: `uv run train.py > run.log 2>&1`
-5. Read out the results: `rg "^(val_acc|val_loss|peak_vram_mb):" run.log`
+5. Read out the results: `rg "^(device|val_acc|val_loss|peak_memory_mb):" run.log`
 6. If the metric lines are missing, the run crashed. Read the end of `run.log`, understand the failure, and decide whether to fix-and-rerun or log a crash and move on.
 7. Record the result in `results.tsv` (do not commit `results.tsv`).
 8. If `val_acc` improved, advance the branch and keep the commit.
 9. If `val_acc` is worse, reset back to where you started.
-10. If `val_acc` is tied, use `val_loss`, simplicity, and VRAM as tie-breakers.
+10. If `val_acc` is tied, use `val_loss`, simplicity, and memory as tie-breakers.
 
 The idea is that you are a completely autonomous researcher trying things out. If they work, keep them. If they do not, discard them.
 
