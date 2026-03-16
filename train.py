@@ -57,6 +57,7 @@ FINAL_LR_FRAC = 0.10
 GRAD_CLIP_NORM = 1.0
 LOSS_NAME = "huber"  # "huber" or "mse"
 HUBER_DELTA = 0.01
+CORR_LOSS_WEIGHT = 3e-4
 SEED = 42
 
 
@@ -86,6 +87,7 @@ class TrainConfig:
     grad_clip_norm: float = GRAD_CLIP_NORM
     loss_name: str = LOSS_NAME
     huber_delta: float = HUBER_DELTA
+    corr_loss_weight: float = CORR_LOSS_WEIGHT
     seed: int = SEED
 
 
@@ -240,10 +242,24 @@ def get_lr_multiplier(progress, train_config):
 
 def compute_loss(predictions, targets, train_config):
     if train_config.loss_name == "mse":
-        return F.mse_loss(predictions, targets)
-    if train_config.loss_name == "huber":
-        return F.huber_loss(predictions, targets, delta=train_config.huber_delta)
-    raise ValueError(f"Unsupported loss: {train_config.loss_name}")
+        base_loss = F.mse_loss(predictions, targets)
+    elif train_config.loss_name == "huber":
+        base_loss = F.huber_loss(predictions, targets, delta=train_config.huber_delta)
+    else:
+        raise ValueError(f"Unsupported loss: {train_config.loss_name}")
+
+    if train_config.corr_loss_weight <= 0:
+        return base_loss
+
+    predictions32 = predictions.float()
+    targets32 = targets.float()
+    pred_centered = predictions32 - predictions32.mean()
+    target_centered = targets32 - targets32.mean()
+    denom = torch.sqrt(
+        torch.clamp(pred_centered.square().mean() * target_centered.square().mean(), min=1e-12)
+    )
+    corr = (pred_centered * target_centered).mean() / denom
+    return base_loss + train_config.corr_loss_weight * (1.0 - corr)
 
 
 def evaluate(model, dataset, batch_size, device):
