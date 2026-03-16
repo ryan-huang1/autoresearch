@@ -46,8 +46,8 @@ These rules are fixed unless a human explicitly changes them:
 - Purge gaps remain part of the split contract.
 - The newest block remains the untouched final test set.
 - The primary keep/discard metric is **`val_corr`**.
-- The default wall-clock training budget is **10 minutes**.
-- The agent may rerun a promising candidate for up to **20 minutes** by explicitly setting a longer time budget, but should do this sparingly.
+- The default wall-clock training budget is **20 minutes**.
+- The agent may rerun a promising candidate for up to **45 minutes** by explicitly setting a longer time budget, but should do this sparingly.
 - Do not add dependencies or change repo-wide instructions without human approval.
 
 Do not change the benchmark to make numbers look better. Improve the forecaster, not the game.
@@ -93,9 +93,9 @@ Secondary metrics such as `val_rmse`, `val_mae`, and `val_sign_acc` are for diag
 
 Unless there is a clear reason to do otherwise:
 
-- Use the default `10 minute` budget for ordinary exploration runs.
-- Optionally rerun a promising candidate at `15-20 minutes` for confirmation.
-- Do not compare a `10 minute` run directly against a `20 minute` run without noting the different budget in the findings and `results.tsv`.
+- Use the default `20 minute` budget for ordinary exploration runs.
+- Optionally rerun a promising candidate at `30-45 minutes` for confirmation.
+- Do not compare a `20 minute` run directly against a `45 minute` run without noting the different budget in the findings and `results.tsv`.
 
 **Simplicity criterion**: all else equal, simpler is better. A tiny improvement that adds brittle complexity is usually not worth keeping. A similarly good or better result with simpler code is a win.
 
@@ -120,16 +120,16 @@ val_sign_acc:      0.531250
 last_train_loss:   0.000456
 smooth_train_loss: 0.000512
 last_grad_norm:    3.142857
-time_budget_s:     600
-max_time_budget_s: 1200
+ time_budget_s:     1200
+ max_time_budget_s: 2700
 startup_seconds:   1.8
-training_seconds:  600.0
+ training_seconds:  1200.0
 eval_seconds:      18.4
-total_seconds:     620.2
+total_seconds:     1220.2
 avg_samples_sec:   3820.5
 peak_vram_mb:      1420.7
 total_windows_K:   1228.8
-num_steps:         600
+ num_steps:         1200
 grad_accum_steps:  8
 device_batch_size: 256
 total_batch_size:  2048
@@ -161,7 +161,7 @@ commit	time_budget_s	training_seconds	val_corr	val_rmse	val_mae	val_sign_acc	mem
 Columns:
 
 1. Short git commit hash.
-2. Configured time budget in seconds, such as `600` or `1200`.
+2. Configured time budget in seconds, such as `1200` or `2700`.
 3. Actual `training_seconds` achieved. Use `0.0` for crashes.
 4. `val_corr` achieved. Higher is better. Use `nan` for crashes.
 5. `val_rmse` achieved. Use `nan` for crashes.
@@ -176,10 +176,10 @@ Example:
 
 ```text
 commit	time_budget_s	training_seconds	val_corr	val_rmse	val_mae	val_sign_acc	memory_gb	status	description	findings_file
-a1b2c3d	600	600.1	0.012300	0.012345	0.009876	0.5312	1.4	keep	baseline lstm findings/2026-03-15-baseline.md
-b2c3d4e	600	600.0	0.018900	0.011980	0.009410	0.5386	1.5	keep	add realized vol features findings/2026-03-15-realized-vol.md
-c3d4e5f	1200	1200.2	0.021400	0.011500	0.009100	0.5410	1.5	keep	confirm promising realized vol run findings/2026-03-15-confirm-realized-vol.md
-d4e5f6g	600	0.0	nan	nan	nan	nan	0.0	crash	bad feature normalization findings/2026-03-15-crash-normalization.md
+a1b2c3d	1200	1200.1	0.012300	0.012345	0.009876	0.5312	1.4	keep	baseline lstm findings/2026-03-15-baseline.md
+b2c3d4e	1200	1200.0	0.018900	0.011980	0.009410	0.5386	1.5	keep	add realized vol features findings/2026-03-15-realized-vol.md
+c3d4e5f	2700	2700.2	0.021400	0.011500	0.009100	0.5410	1.5	keep	confirm promising realized vol run findings/2026-03-15-confirm-realized-vol.md
+d4e5f6g	1200	0.0	nan	nan	nan	nan	0.0	crash	bad feature normalization findings/2026-03-15-crash-normalization.md
 ```
 
 ## Findings Reports
@@ -236,7 +236,7 @@ LOOP FOREVER:
 5. Commit the tracked code changes.
 6. Run the experiment:
    - Default screen: `uv run train.py > run.log 2>&1`
-   - Optional confirmation rerun: `uv run train.py --time-budget-seconds 1200 > run.log 2>&1`
+   - Optional confirmation rerun: `uv run train.py --time-budget-seconds 2700 > run.log 2>&1`
 7. Read out the results from `run.log`:
    - `time_budget_s`
    - `training_seconds`
@@ -249,7 +249,7 @@ LOOP FOREVER:
 9. Write the detailed markdown report to `findings/`.
 10. Append the structured result to `results.tsv`.
 11. Compare runs fairly at the same budget whenever possible.
-12. If a `10 minute` run is promising, you may rerun it at up to `20 minutes` to confirm the signal before deciding whether to keep it.
+12. If a `20 minute` run is promising, you may rerun it at up to `45 minutes` to confirm the signal before deciding whether to keep it.
 13. If `val_corr` improved on a fair comparison, keep the change.
 14. If `val_corr` is worse or equal, restore the tracked code to the last kept commit, but keep the local findings and result logs.
 
@@ -262,7 +262,7 @@ If a run crashes:
 
 ## Timeout
 
-Each experiment should take about 10 minutes of training time by default, or up to 20 minutes for an explicit confirmation rerun, plus startup and evaluation overhead. If a run goes meaningfully beyond its configured budget and is clearly hung, stop it, log the failure, and move on.
+Each experiment should take about 20 minutes of training time by default, or up to 45 minutes for an explicit confirmation rerun, plus startup and evaluation overhead. If a run goes meaningfully beyond its configured budget and is clearly hung, stop it, log the failure, and move on.
 
 ## Never Stop
 
