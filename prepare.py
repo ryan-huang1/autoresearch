@@ -1,389 +1,554 @@
 """
-One-time data preparation for autoresearch experiments.
-Downloads data shards and trains a BPE tokenizer.
+One-time data preparation for autoresearch time-series experiments.
 
 Usage:
-    python prepare.py                  # full prep (download + tokenizer)
-    python prepare.py --num-shards 8   # download only 8 shards (for testing)
+    uv run prepare.py
+    uv run prepare.py --input-csv /path/to/sol.csv
 
-Data and tokenizer are stored in ~/.cache/autoresearch/.
+Prepared artifacts are stored under ~/.cache/autoresearch/timeseries by default.
 """
 
-import os
-import sys
-import time
-import math
-import argparse
-import pickle
-from multiprocessing import Pool
+from __future__ import annotations
 
-import requests
-import pyarrow.parquet as pq
-import rustbpe
-import tiktoken
+import argparse
+import json
+import os
+import time
+from contextlib import nullcontext
+from dataclasses import dataclass
+
+import numpy as np
+import pandas as pd
 import torch
 
 # ---------------------------------------------------------------------------
-# Constants (fixed, do not modify)
+# Fixed benchmark contract (only change with explicit human approval)
 # ---------------------------------------------------------------------------
 
-MAX_SEQ_LEN = 2048       # context length
-TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
-EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
+TIME_BUDGET = 600
+MAX_TIME_BUDGET = 1_200
+HORIZON_BARS = 60
+VAL_RATIO = 0.15
+TEST_RATIO = 0.15
+NUM_VAL_FOLDS = 3
+EVAL_SAMPLES = 131_072
+PRIMARY_METRIC = "val_corr"
+PRIMARY_METRIC_DIRECTION = "higher_is_better"
+FEATURE_NAMES = (
+    "log_close",
+    "log_volume",
+    "log_return_1",
+    "log_return_5",
+    "log_return_15",
+    "log_return_60",
+    "body_frac",
+    "range_frac",
+    "upper_wick_frac",
+    "lower_wick_frac",
+    "close_vs_sma_60",
+    "close_vs_sma_300",
+    "volume_zscore_60",
+    "realized_vol_60",
+    "realized_vol_300",
+    "log_seconds_since_trade",
+    "is_synthetic_bar",
+)
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Signal-engineering defaults (future experiment agents may modify)
 # ---------------------------------------------------------------------------
 
-CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
-DATA_DIR = os.path.join(CACHE_DIR, "data")
-TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
-MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
-VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)
-VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
-VOCAB_SIZE = 8192
+LOOKBACK_BARS = 300
+FEATURE_WINDOWS = (10, 60, 300)
 
-# BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
-SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
-
-SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
-BOS_TOKEN = "<|reserved_0|>"
+# Derived from the benchmark contract plus the current signal settings.
+FEATURE_WARMUP_BARS = max(FEATURE_WINDOWS)
+PURGE_BARS = LOOKBACK_BARS + HORIZON_BARS
 
 # ---------------------------------------------------------------------------
-# Data download
+# Paths
 # ---------------------------------------------------------------------------
 
-def download_single_shard(index):
-    """Download one parquet shard with retries. Returns True on success."""
-    filename = f"shard_{index:05d}.parquet"
-    filepath = os.path.join(DATA_DIR, filename)
-    if os.path.exists(filepath):
-        return True
+REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_INPUT_CSV = os.path.join(REPO_DIR, "gecko_pool_1s_history.csv")
+CACHE_DIR = os.environ.get(
+    "AUTORESEARCH_CACHE_DIR",
+    os.path.join(os.path.expanduser("~"), ".cache", "autoresearch"),
+)
+PREPARED_DIR = os.environ.get(
+    "AUTORESEARCH_PREPARED_DIR",
+    os.path.join(CACHE_DIR, "timeseries"),
+)
+FEATURES_FILENAME = "features.npy"
+TARGETS_FILENAME = "targets.npy"
+METADATA_FILENAME = "metadata.json"
+MIN_STD = 1e-6
+EPS = 1e-12
 
-    url = f"{BASE_URL}/{filename}"
-    max_attempts = 5
-    for attempt in range(1, max_attempts + 1):
-        try:
-            response = requests.get(url, stream=True, timeout=30)
-            response.raise_for_status()
-            temp_path = filepath + ".tmp"
-            with open(temp_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-            os.rename(temp_path, filepath)
-            print(f"  Downloaded {filename}")
-            return True
-        except (requests.RequestException, IOError) as e:
-            print(f"  Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
-            for path in [filepath + ".tmp", filepath]:
-                if os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
-            if attempt < max_attempts:
-                time.sleep(2 ** attempt)
-    return False
-
-
-def download_data(num_shards, download_workers=8):
-    """Download training shards + pinned validation shard."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    num_train = min(num_shards, MAX_SHARD)
-    ids = list(range(num_train))
-    if VAL_SHARD not in ids:
-        ids.append(VAL_SHARD)
-
-    # Count what's already downloaded
-    existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
-    if existing == len(ids):
-        print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
-        return
-
-    needed = len(ids) - existing
-    print(f"Data: downloading {needed} shards ({existing} already exist)...")
-
-    workers = max(1, min(download_workers, needed))
-    with Pool(processes=workers) as pool:
-        results = pool.map(download_single_shard, ids)
-
-    ok = sum(1 for r in results if r)
-    print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
 
 # ---------------------------------------------------------------------------
-# Tokenizer training
+# Metadata and dataset loading
 # ---------------------------------------------------------------------------
 
-def list_parquet_files():
-    """Return sorted list of parquet file paths in the data directory."""
-    files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith(".parquet") and not f.endswith(".tmp"))
-    return [os.path.join(DATA_DIR, f) for f in files]
+@dataclass
+class PreparedDataset:
+    features: np.ndarray
+    targets: np.ndarray
+    metadata: dict
+
+    def __post_init__(self):
+        self.lookback_bars = int(self.metadata["lookback_bars"])
+        self.window_offsets = np.arange(self.lookback_bars, dtype=np.int64)
+
+    @property
+    def input_dim(self):
+        return int(self.features.shape[1])
+
+    def split_bounds(self, split):
+        info = self.metadata["splits"][split]
+        return int(info["sample_start"]), int(info["sample_stop"])
 
 
-def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
-    """Yield documents from training split (all shards except pinned val shard)."""
-    parquet_paths = [p for p in list_parquet_files() if not p.endswith(VAL_FILENAME)]
-    nchars = 0
-    for filepath in parquet_paths:
-        pf = pq.ParquetFile(filepath)
-        for rg_idx in range(pf.num_row_groups):
-            rg = pf.read_row_group(rg_idx)
-            for text in rg.column("text").to_pylist():
-                doc = text[:doc_cap] if len(text) > doc_cap else text
-                nchars += len(doc)
-                yield doc
-                if nchars >= max_chars:
-                    return
+def load_prepared_dataset(prepared_dir=PREPARED_DIR):
+    metadata_path = os.path.join(prepared_dir, METADATA_FILENAME)
+    features_path = os.path.join(prepared_dir, FEATURES_FILENAME)
+    targets_path = os.path.join(prepared_dir, TARGETS_FILENAME)
+    if not os.path.exists(metadata_path):
+        raise FileNotFoundError(
+            f"No prepared dataset found at {prepared_dir}. Run `uv run prepare.py` first."
+        )
+    with open(metadata_path, "r", encoding="utf-8") as f:
+        metadata = json.load(f)
+    features = np.load(features_path, mmap_mode="r")
+    targets = np.load(targets_path, mmap_mode="r")
+    return PreparedDataset(features=features, targets=targets, metadata=metadata)
 
 
-def train_tokenizer():
-    """Train BPE tokenizer using rustbpe, save as tiktoken pickle."""
-    tokenizer_pkl = os.path.join(TOKENIZER_DIR, "tokenizer.pkl")
-    token_bytes_path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
+# ---------------------------------------------------------------------------
+# Numeric helpers
+# ---------------------------------------------------------------------------
 
-    if os.path.exists(tokenizer_pkl) and os.path.exists(token_bytes_path):
-        print(f"Tokenizer: already trained at {TOKENIZER_DIR}")
-        return
+def lagged_difference(values, lag):
+    out = np.full(values.shape, np.nan, dtype=np.float32)
+    out[lag:] = values[lag:] - values[:-lag]
+    return out
 
-    os.makedirs(TOKENIZER_DIR, exist_ok=True)
 
-    parquet_files = list_parquet_files()
-    if len(parquet_files) < 2:
-        print("Tokenizer: need at least 2 data shards (1 train + 1 val). Download more data first.")
-        sys.exit(1)
+def rolling_mean(values, window):
+    values64 = np.asarray(values, dtype=np.float64)
+    out = np.full(values64.shape, np.nan, dtype=np.float32)
+    if window <= 1:
+        out[:] = values64
+        return out
+    cumsum = np.cumsum(values64, dtype=np.float64)
+    totals = cumsum[window - 1 :].copy()
+    totals[1:] -= cumsum[:-window]
+    out[window - 1 :] = totals / window
+    return out
 
-    # --- Train with rustbpe ---
-    print("Tokenizer: training BPE tokenizer...")
-    t0 = time.time()
 
-    tokenizer = rustbpe.Tokenizer()
-    vocab_size_no_special = VOCAB_SIZE - len(SPECIAL_TOKENS)
-    tokenizer.train_from_iterator(text_iterator(), vocab_size_no_special, pattern=SPLIT_PATTERN)
+def rolling_std(values, window):
+    values64 = np.asarray(values, dtype=np.float64)
+    out = np.full(values64.shape, np.nan, dtype=np.float32)
+    if window <= 1:
+        out[:] = 0.0
+        return out
+    cumsum = np.cumsum(values64, dtype=np.float64)
+    cumsum_sq = np.cumsum(values64 * values64, dtype=np.float64)
+    totals = cumsum[window - 1 :].copy()
+    totals[1:] -= cumsum[:-window]
+    sq_totals = cumsum_sq[window - 1 :].copy()
+    sq_totals[1:] -= cumsum_sq[:-window]
+    means = totals / window
+    variances = np.maximum(sq_totals / window - means * means, 0.0)
+    out[window - 1 :] = np.sqrt(variances)
+    return out
 
-    # Build tiktoken encoding from trained merges
-    pattern = tokenizer.get_pattern()
-    mergeable_ranks = {bytes(k): v for k, v in tokenizer.get_mergeable_ranks()}
-    tokens_offset = len(mergeable_ranks)
-    special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
-    enc = tiktoken.Encoding(
-        name="rustbpe",
-        pat_str=pattern,
-        mergeable_ranks=mergeable_ranks,
-        special_tokens=special_tokens,
+
+def safe_zscore(values, mean_values, std_values):
+    return (values - mean_values) / np.maximum(std_values, MIN_STD)
+
+
+def dense_row_to_timestamp(metadata, row_idx):
+    return int(metadata["dense_start_time"]) + int(row_idx)
+
+
+def summarize_split(name, split_info):
+    return (
+        f"{name:>5s}: {split_info['num_samples']:,} samples | "
+        f"{split_info['timestamp_start']} -> {split_info['timestamp_stop']}"
     )
 
-    # Save tokenizer
-    with open(tokenizer_pkl, "wb") as f:
-        pickle.dump(enc, f)
-
-    t1 = time.time()
-    print(f"Tokenizer: trained in {t1 - t0:.1f}s, saved to {tokenizer_pkl}")
-
-    # --- Build token_bytes lookup for BPB evaluation ---
-    print("Tokenizer: building token_bytes lookup...")
-    special_set = set(SPECIAL_TOKENS)
-    token_bytes_list = []
-    for token_id in range(enc.n_vocab):
-        token_str = enc.decode([token_id])
-        if token_str in special_set:
-            token_bytes_list.append(0)
-        else:
-            token_bytes_list.append(len(token_str.encode("utf-8")))
-    token_bytes_tensor = torch.tensor(token_bytes_list, dtype=torch.int32)
-    torch.save(token_bytes_tensor, token_bytes_path)
-    print(f"Tokenizer: saved token_bytes to {token_bytes_path}")
-
-    # Sanity check
-    test = "Hello world! Numbers: 123. Unicode: 你好"
-    encoded = enc.encode_ordinary(test)
-    decoded = enc.decode(encoded)
-    assert decoded == test, f"Tokenizer roundtrip failed: {test!r} -> {decoded!r}"
-    print(f"Tokenizer: sanity check passed (vocab_size={enc.n_vocab})")
 
 # ---------------------------------------------------------------------------
-# Runtime utilities (imported by train.py)
+# Data preparation
 # ---------------------------------------------------------------------------
 
-class Tokenizer:
-    """Minimal tokenizer wrapper. Training is handled above."""
-
-    def __init__(self, enc):
-        self.enc = enc
-        self.bos_token_id = enc.encode_single_token(BOS_TOKEN)
-
-    @classmethod
-    def from_directory(cls, tokenizer_dir=TOKENIZER_DIR):
-        with open(os.path.join(tokenizer_dir, "tokenizer.pkl"), "rb") as f:
-            enc = pickle.load(f)
-        return cls(enc)
-
-    def get_vocab_size(self):
-        return self.enc.n_vocab
-
-    def get_bos_token_id(self):
-        return self.bos_token_id
-
-    def encode(self, text, prepend=None, num_threads=8):
-        if prepend is not None:
-            prepend_id = prepend if isinstance(prepend, int) else self.enc.encode_single_token(prepend)
-        if isinstance(text, str):
-            ids = self.enc.encode_ordinary(text)
-            if prepend is not None:
-                ids.insert(0, prepend_id)
-        elif isinstance(text, list):
-            ids = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
-            if prepend is not None:
-                for row in ids:
-                    row.insert(0, prepend_id)
-        else:
-            raise ValueError(f"Invalid input type: {type(text)}")
-        return ids
-
-    def decode(self, ids):
-        return self.enc.decode(ids)
+def load_raw_bars(input_csv):
+    usecols = ["time", "open", "high", "low", "close", "volume"]
+    dtypes = {
+        "time": "int64",
+        "open": "float32",
+        "high": "float32",
+        "low": "float32",
+        "close": "float32",
+        "volume": "float32",
+    }
+    df = pd.read_csv(input_csv, usecols=usecols, dtype=dtypes)
+    if df.empty:
+        raise ValueError(f"No rows found in {input_csv}")
+    df = df.sort_values("time").drop_duplicates("time", keep="last").reset_index(drop=True)
+    times = df["time"].to_numpy(dtype=np.int64, copy=True)
+    if np.any(np.diff(times) <= 0):
+        raise ValueError("Expected strictly increasing timestamps after dedupe.")
+    bars = {
+        "open": df["open"].to_numpy(dtype=np.float32, copy=True),
+        "high": df["high"].to_numpy(dtype=np.float32, copy=True),
+        "low": df["low"].to_numpy(dtype=np.float32, copy=True),
+        "close": df["close"].to_numpy(dtype=np.float32, copy=True),
+        "volume": df["volume"].to_numpy(dtype=np.float32, copy=True),
+    }
+    return times, bars
 
 
-def get_token_bytes(device="cpu"):
-    path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-    with open(path, "rb") as f:
-        return torch.load(f, map_location=device)
+def densify_bars(times, raw_bars):
+    segment_lengths = np.diff(np.append(times, times[-1] + 1)).astype(np.int64, copy=False)
+    dense_length = int(segment_lengths.sum())
+    dense_close = np.repeat(raw_bars["close"], segment_lengths).astype(np.float32, copy=False)
+    dense_open = dense_close.copy()
+    dense_high = dense_close.copy()
+    dense_low = dense_close.copy()
+    dense_volume = np.zeros(dense_length, dtype=np.float32)
+    observed = np.zeros(dense_length, dtype=np.float32)
+
+    start_rows = np.empty(times.shape[0], dtype=np.int32)
+    start_rows[0] = 0
+    if len(times) > 1:
+        np.cumsum(segment_lengths[:-1], out=start_rows[1:])
+
+    dense_open[start_rows] = raw_bars["open"]
+    dense_high[start_rows] = raw_bars["high"]
+    dense_low[start_rows] = raw_bars["low"]
+    dense_volume[start_rows] = raw_bars["volume"]
+    observed[start_rows] = 1.0
+
+    dense_rows = np.arange(dense_length, dtype=np.int32)
+    seconds_since_trade = dense_rows - np.repeat(start_rows, segment_lengths)
+
+    return {
+        "open": dense_open,
+        "high": dense_high,
+        "low": dense_low,
+        "close": dense_close,
+        "volume": dense_volume,
+        "observed": observed,
+        "seconds_since_trade": seconds_since_trade.astype(np.float32, copy=False),
+        "dense_start_time": int(times[0]),
+        "dense_end_time": int(times[-1]),
+        "num_raw_rows": int(len(times)),
+    }
 
 
-def _document_batches(split, tokenizer_batch_size=128):
-    """Infinite iterator over document batches from parquet files."""
-    parquet_paths = list_parquet_files()
-    assert len(parquet_paths) > 0, "No parquet files found. Run prepare.py first."
-    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
-    if split == "train":
-        parquet_paths = [p for p in parquet_paths if p != val_path]
-        assert len(parquet_paths) > 0, "No training shards found."
+def build_splits(num_rows, dense_start_time):
+    min_sample_end = LOOKBACK_BARS + FEATURE_WARMUP_BARS - 2
+    max_sample_end = num_rows - HORIZON_BARS
+    if max_sample_end <= min_sample_end:
+        raise ValueError("Dataset is too short for the configured lookback, horizon, and features.")
+
+    usable_samples = max_sample_end - min_sample_end
+    val_len = max(1, int(usable_samples * VAL_RATIO))
+    test_len = max(1, int(usable_samples * TEST_RATIO))
+
+    test_start = max_sample_end - test_len
+    val_stop = test_start - PURGE_BARS
+    val_start = val_stop - val_len
+    train_stop = val_start - PURGE_BARS
+    if train_stop <= min_sample_end:
+        raise ValueError("Not enough room for train/val/test splits after purge gaps.")
+
+    splits = {
+        "train": {"sample_start": int(min_sample_end), "sample_stop": int(train_stop)},
+        "val": {"sample_start": int(val_start), "sample_stop": int(val_stop)},
+        "test": {"sample_start": int(test_start), "sample_stop": int(max_sample_end)},
+    }
+
+    for split_info in splits.values():
+        split_info["num_samples"] = int(split_info["sample_stop"] - split_info["sample_start"])
+        split_info["timestamp_start"] = dense_start_time + split_info["sample_start"]
+        split_info["timestamp_stop"] = dense_start_time + split_info["sample_stop"] - 1
+
+    fold_len = max(1, (splits["val"]["sample_stop"] - splits["val"]["sample_start"]) // NUM_VAL_FOLDS)
+    validation_folds = []
+    fold_start = splits["val"]["sample_start"]
+    for fold_idx in range(NUM_VAL_FOLDS):
+        fold_stop = splits["val"]["sample_stop"] if fold_idx == NUM_VAL_FOLDS - 1 else min(
+            splits["val"]["sample_stop"], fold_start + fold_len
+        )
+        fold_train_stop = fold_start - PURGE_BARS
+        if fold_train_stop <= min_sample_end:
+            break
+        validation_folds.append(
+            {
+                "fold": fold_idx,
+                "train_start": int(min_sample_end),
+                "train_stop": int(fold_train_stop),
+                "val_start": int(fold_start),
+                "val_stop": int(fold_stop),
+                "train_timestamp_start": dense_start_time + int(min_sample_end),
+                "train_timestamp_stop": dense_start_time + int(fold_train_stop) - 1,
+                "val_timestamp_start": dense_start_time + int(fold_start),
+                "val_timestamp_stop": dense_start_time + int(fold_stop) - 1,
+            }
+        )
+        fold_start = fold_stop
+
+    return splits, validation_folds, int(min_sample_end), int(max_sample_end)
+
+
+def build_target(log_close):
+    target = np.full(log_close.shape, np.nan, dtype=np.float32)
+    target[:-HORIZON_BARS] = log_close[HORIZON_BARS:] - log_close[:-HORIZON_BARS]
+    return target
+
+
+def generate_feature_columns(dense_bars):
+    open_ = dense_bars["open"]
+    high = dense_bars["high"]
+    low = dense_bars["low"]
+    close = dense_bars["close"]
+    volume = dense_bars["volume"]
+    observed = dense_bars["observed"]
+    seconds_since_trade = dense_bars["seconds_since_trade"]
+
+    safe_close = np.maximum(close, EPS)
+    safe_open = np.maximum(open_, EPS)
+    safe_volume = np.maximum(volume, 0.0)
+
+    log_close = np.log(safe_close).astype(np.float32)
+    log_volume = np.log1p(safe_volume).astype(np.float32)
+    log_return_1 = lagged_difference(log_close, 1)
+    realized_vol_input = np.nan_to_num(log_return_1, nan=0.0)
+
+    yield "log_close", log_close
+    yield "log_volume", log_volume
+    yield "log_return_1", log_return_1
+    yield "log_return_5", lagged_difference(log_close, 5)
+    yield "log_return_15", lagged_difference(log_close, 15)
+    yield "log_return_60", lagged_difference(log_close, 60)
+    yield "body_frac", ((close - open_) / safe_open).astype(np.float32)
+    yield "range_frac", ((high - low) / safe_close).astype(np.float32)
+    yield "upper_wick_frac", ((high - np.maximum(open_, close)) / safe_close).astype(np.float32)
+    yield "lower_wick_frac", ((np.minimum(open_, close) - low) / safe_close).astype(np.float32)
+
+    close_sma_60 = rolling_mean(close, 60)
+    close_sma_300 = rolling_mean(close, 300)
+    yield "close_vs_sma_60", ((close / np.maximum(close_sma_60, EPS)) - 1.0).astype(np.float32)
+    yield "close_vs_sma_300", ((close / np.maximum(close_sma_300, EPS)) - 1.0).astype(np.float32)
+
+    volume_mean_60 = rolling_mean(log_volume, 60)
+    volume_std_60 = rolling_std(log_volume, 60)
+    yield "volume_zscore_60", safe_zscore(log_volume, volume_mean_60, volume_std_60).astype(np.float32)
+    yield "realized_vol_60", rolling_std(realized_vol_input, 60)
+    yield "realized_vol_300", rolling_std(realized_vol_input, 300)
+    yield "log_seconds_since_trade", np.log1p(seconds_since_trade).astype(np.float32)
+    yield "is_synthetic_bar", (1.0 - observed).astype(np.float32)
+
+
+def write_prepared_arrays(dense_bars, splits, output_dir):
+    num_rows = len(dense_bars["close"])
+    feature_path = os.path.join(output_dir, FEATURES_FILENAME)
+    target_path = os.path.join(output_dir, TARGETS_FILENAME)
+
+    log_close = np.log(np.maximum(dense_bars["close"], EPS)).astype(np.float32)
+    target = build_target(log_close)
+    target_memmap = np.lib.format.open_memmap(
+        target_path, mode="w+", dtype=np.float32, shape=target.shape
+    )
+    target_memmap[:] = target
+    target_memmap.flush()
+
+    scaler_row_start = FEATURE_WARMUP_BARS - 1
+    scaler_row_stop = splits["train"]["sample_stop"]
+
+    feature_names = []
+    scaler = {}
+    features_memmap = np.lib.format.open_memmap(
+        feature_path, mode="w+", dtype=np.float32, shape=(num_rows, len(FEATURE_NAMES))
+    )
+    for feature_idx, (name, values) in enumerate(generate_feature_columns(dense_bars)):
+        train_slice = values[scaler_row_start:scaler_row_stop]
+        mean = float(np.nanmean(train_slice))
+        std = float(np.nanstd(train_slice))
+        if not np.isfinite(std) or std < MIN_STD:
+            std = 1.0
+        scaled = ((values - mean) / std).astype(np.float32, copy=False)
+        np.nan_to_num(scaled, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+        features_memmap[:, feature_idx] = scaled
+        feature_names.append(name)
+        scaler[name] = {"mean": mean, "std": std}
+    features_memmap.flush()
+    if tuple(feature_names) != FEATURE_NAMES:
+        raise ValueError("Feature generator order drifted from the benchmark feature list.")
+    return feature_names, scaler
+
+
+def save_metadata(output_dir, metadata):
+    metadata_path = os.path.join(output_dir, METADATA_FILENAME)
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2, sort_keys=True)
+
+
+def prepare_dataset(input_csv=DEFAULT_INPUT_CSV, output_dir=PREPARED_DIR):
+    t0 = time.time()
+    if not os.path.exists(input_csv):
+        raise FileNotFoundError(f"Input CSV not found: {input_csv}")
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    raw_times, raw_bars = load_raw_bars(input_csv)
+    dense_bars = densify_bars(raw_times, raw_bars)
+    num_dense_rows = len(dense_bars["close"])
+    splits, validation_folds, min_sample_end, max_sample_end = build_splits(
+        num_dense_rows, dense_bars["dense_start_time"]
+    )
+    feature_names, scaler = write_prepared_arrays(dense_bars, splits, output_dir)
+
+    metadata = {
+        "version": 1,
+        "input_csv": os.path.abspath(input_csv),
+        "prepared_dir": os.path.abspath(output_dir),
+        "time_budget": TIME_BUDGET,
+        "default_time_budget_seconds": TIME_BUDGET,
+        "max_time_budget_seconds": MAX_TIME_BUDGET,
+        "primary_metric": PRIMARY_METRIC,
+        "primary_metric_direction": PRIMARY_METRIC_DIRECTION,
+        "lookback_bars": LOOKBACK_BARS,
+        "horizon_bars": HORIZON_BARS,
+        "purge_bars": PURGE_BARS,
+        "eval_samples": EVAL_SAMPLES,
+        "feature_windows": list(FEATURE_WINDOWS),
+        "feature_warmup_bars": FEATURE_WARMUP_BARS,
+        "feature_names": feature_names,
+        "scaler": scaler,
+        "dense_start_time": dense_bars["dense_start_time"],
+        "dense_end_time": dense_bars["dense_end_time"],
+        "num_raw_rows": dense_bars["num_raw_rows"],
+        "num_dense_rows": int(num_dense_rows),
+        "num_observed_rows": int(np.count_nonzero(dense_bars["observed"])),
+        "num_synthetic_rows": int(num_dense_rows - np.count_nonzero(dense_bars["observed"])),
+        "sample_end_start": min_sample_end,
+        "sample_end_stop": max_sample_end,
+        "splits": splits,
+        "validation_folds": validation_folds,
+    }
+    save_metadata(output_dir, metadata)
+
+    elapsed = time.time() - t0
+    print(f"Prepared dataset in {elapsed:.1f}s")
+    print(f"Input CSV: {os.path.abspath(input_csv)}")
+    print(f"Prepared dir: {os.path.abspath(output_dir)}")
+    print(f"Observed bars: {metadata['num_observed_rows']:,}")
+    print(f"Synthetic bars: {metadata['num_synthetic_rows']:,}")
+    print(f"Features: {len(feature_names)} -> {', '.join(feature_names)}")
+    print(summarize_split("train", splits["train"]))
+    print(summarize_split("val", splits["val"]))
+    print(summarize_split("test", splits["test"]))
+    return metadata
+
+
+# ---------------------------------------------------------------------------
+# Runtime helpers for train.py
+# ---------------------------------------------------------------------------
+
+def build_window_batch(dataset, endpoints, device):
+    row_idx = endpoints[:, None] - dataset.lookback_bars + 1 + dataset.window_offsets[None, :]
+    x_np = np.asarray(dataset.features[row_idx], dtype=np.float32)
+    y_np = np.asarray(dataset.targets[endpoints], dtype=np.float32)
+
+    x = torch.from_numpy(x_np)
+    y = torch.from_numpy(y_np)
+    if device.type == "cuda":
+        x = x.pin_memory().to(device, non_blocking=True)
+        y = y.pin_memory().to(device, non_blocking=True)
     else:
-        parquet_paths = [val_path]
-    epoch = 1
-    while True:
-        for filepath in parquet_paths:
-            pf = pq.ParquetFile(filepath)
-            for rg_idx in range(pf.num_row_groups):
-                rg = pf.read_row_group(rg_idx)
-                batch = rg.column('text').to_pylist()
-                for i in range(0, len(batch), tokenizer_batch_size):
-                    yield batch[i:i+tokenizer_batch_size], epoch
-        epoch += 1
+        x = x.to(device)
+        y = y.to(device)
+    return x, y
 
 
-def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
-    """
-    BOS-aligned dataloader with best-fit packing.
-    Every row starts with BOS. Documents packed using best-fit to minimize cropping.
-    When no document fits remaining space, crops shortest doc to fill exactly.
-    100% utilization (no padding).
-    """
-    assert split in ["train", "val"]
-    row_capacity = T + 1
-    batches = _document_batches(split)
-    bos_token = tokenizer.get_bos_token_id()
-    doc_buffer = []
-    epoch = 1
+def sample_batch(dataset, split, batch_size, device, rng):
+    start, stop = dataset.split_bounds(split)
+    endpoints = rng.integers(start, stop, size=batch_size, endpoint=False, dtype=np.int64)
+    return build_window_batch(dataset, endpoints, device)
 
-    def refill_buffer():
-        nonlocal epoch
-        doc_batch, epoch = next(batches)
-        token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
-        doc_buffer.extend(token_lists)
 
-    # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
-    row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
-    cpu_inputs = cpu_buffer[:B * T].view(B, T)
-    cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
+def select_eval_endpoints(dataset, split, max_samples=None):
+    start, stop = dataset.split_bounds(split)
+    total = stop - start
+    limit = total if max_samples is None else min(total, int(max_samples))
+    if limit <= 0:
+        raise ValueError(f"Split {split} has no available samples.")
+    if limit == total:
+        return np.arange(start, stop, dtype=np.int64)
+    return np.linspace(start, stop - 1, num=limit, dtype=np.int64)
 
-    while True:
-        for row_idx in range(B):
-            pos = 0
-            while pos < row_capacity:
-                while len(doc_buffer) < buffer_size:
-                    refill_buffer()
 
-                remaining = row_capacity - pos
+def iter_eval_batches(dataset, split, batch_size, device, max_samples=None):
+    endpoints = select_eval_endpoints(dataset, split, max_samples=max_samples)
+    for start_idx in range(0, len(endpoints), batch_size):
+        batch_endpoints = endpoints[start_idx : start_idx + batch_size]
+        yield build_window_batch(dataset, batch_endpoints, device)
 
-                # Find largest doc that fits entirely
-                best_idx = -1
-                best_len = 0
-                for i, doc in enumerate(doc_buffer):
-                    doc_len = len(doc)
-                    if doc_len <= remaining and doc_len > best_len:
-                        best_idx = i
-                        best_len = doc_len
 
-                if best_idx >= 0:
-                    doc = doc_buffer.pop(best_idx)
-                    row_buffer[row_idx, pos:pos + len(doc)] = torch.tensor(doc, dtype=torch.long)
-                    pos += len(doc)
-                else:
-                    # No doc fits — crop shortest to fill remaining
-                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
-                    doc = doc_buffer.pop(shortest_idx)
-                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
-                    pos += remaining
+def regression_metrics(predictions, targets):
+    diff = predictions - targets
+    mse = float(np.mean(diff * diff))
+    mae = float(np.mean(np.abs(diff)))
+    pred_centered = predictions - predictions.mean()
+    target_centered = targets - targets.mean()
+    denom = float(np.sqrt(np.mean(pred_centered * pred_centered) * np.mean(target_centered * target_centered)))
+    corr = 0.0 if denom < MIN_STD else float(np.mean(pred_centered * target_centered) / denom)
+    sign_acc = float(np.mean((predictions >= 0.0) == (targets >= 0.0)))
+    return {
+        "rmse": float(np.sqrt(mse)),
+        "mae": mae,
+        "corr": corr,
+        "sign_accuracy": sign_acc,
+    }
 
-        cpu_inputs.copy_(row_buffer[:, :-1])
-        cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
-        yield inputs, targets, epoch
-
-# ---------------------------------------------------------------------------
-# Evaluation (DO NOT CHANGE — this is the fixed metric)
-# ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate_bpb(model, tokenizer, batch_size):
-    """
-    Bits per byte (BPB): vocab size-independent evaluation metric.
-    Sums per-token cross-entropy (in nats), sums target byte lengths,
-    then converts nats/byte to bits/byte. Special tokens (byte length 0)
-    are excluded from both sums.
-    Uses fixed MAX_SEQ_LEN so results are comparable across configs.
-    """
-    token_bytes = get_token_bytes(device="cuda")
-    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
-    steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
-    total_nats = 0.0
-    total_bytes = 0
-    for _ in range(steps):
-        x, y, _ = next(val_loader)
-        loss_flat = model(x, y, reduction='none').view(-1)
-        y_flat = y.view(-1)
-        nbytes = token_bytes[y_flat]
-        mask = nbytes > 0
-        total_nats += (loss_flat * mask).sum().item()
-        total_bytes += nbytes.sum().item()
-    return total_nats / (math.log(2) * total_bytes)
+def evaluate_regression(model, dataset, split, batch_size, device, autocast_ctx=None, max_samples=None):
+    ctx = autocast_ctx if autocast_ctx is not None else nullcontext()
+    pred_chunks = []
+    target_chunks = []
+    for x, y in iter_eval_batches(dataset, split, batch_size, device, max_samples=max_samples):
+        with ctx:
+            preds = model(x)
+        pred_chunks.append(preds.float().cpu())
+        target_chunks.append(y.float().cpu())
+    predictions = torch.cat(pred_chunks).numpy()
+    targets = torch.cat(target_chunks).numpy()
+    return regression_metrics(predictions, targets)
+
 
 # ---------------------------------------------------------------------------
-# Main
+# CLI
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
-    parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
-    parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
+    parser = argparse.ArgumentParser(description="Prepare dense SOL OHLCV features for forecasting.")
+    parser.add_argument(
+        "--input-csv",
+        type=str,
+        default=DEFAULT_INPUT_CSV,
+        help="Path to the raw SOL OHLCV CSV.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=PREPARED_DIR,
+        help="Directory for prepared arrays and metadata.",
+    )
     args = parser.parse_args()
-
-    num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
-
-    print(f"Cache directory: {CACHE_DIR}")
-    print()
-
-    # Step 1: Download data
-    download_data(num_shards, download_workers=args.download_workers)
-    print()
-
-    # Step 2: Train tokenizer
-    train_tokenizer()
-    print()
-    print("Done! Ready to train.")
+    prepare_dataset(input_csv=args.input_csv, output_dir=args.output_dir)

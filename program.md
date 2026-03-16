@@ -1,114 +1,262 @@
 # autoresearch
 
-This is an experiment to have the LLM do its own research.
+This repo now runs autonomous **time-series forecasting** experiments on SOL OHLCV data.
+
+The job of the experiment agent is to improve the forecasting pipeline by iterating on:
+
+- the **model** in `train.py`
+- the **derived signals / feature engineering** in `prepare.py`
+
+The job of the human is to keep the **benchmark definition** stable so experiments remain comparable.
 
 ## Setup
 
 To set up a new experiment, work with the user to:
 
-1. **Agree on a run tag**: propose a tag based on today's date (e.g. `mar5`). The branch `autoresearch/<tag>` must not already exist — this is a fresh run.
-2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current master.
-3. **Read the in-scope files**: The repo is small. Read these files for full context:
-   - `README.md` — repository context.
-   - `prepare.py` — fixed constants, data prep, tokenizer, dataloader, evaluation. Do not modify.
-   - `train.py` — the file you modify. Model architecture, optimizer, training loop.
-4. **Verify data exists**: Check that `~/.cache/autoresearch/` contains data shards and a tokenizer. If not, tell the human to run `uv run prepare.py`.
-5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
-6. **Confirm and go**: Confirm setup looks good.
+1. **Agree on a run tag**: propose a tag based on today's date (for example `mar15`). The branch `autoresearch/<tag>` must not already exist.
+2. **Create the branch**: create `autoresearch/<tag>` from the current default branch.
+3. **Read the in-scope files**:
+   - `README.md` for repository context.
+   - `prepare.py` for the data contract, feature pipeline, split logic, and evaluation helpers.
+   - `train.py` for the model, optimizer, and training loop.
+   - `program.md` for the autonomous research rules.
+4. **Verify the raw dataset exists**: confirm `gecko_pool_1s_history.csv` is present in the repo root.
+5. **Verify prepared artifacts exist**: confirm `~/.cache/autoresearch/timeseries/` contains `features.npy`, `targets.npy`, and `metadata.json`, and if they were built from an older CSV, rerun `uv run prepare.py`.
+6. **Initialize local experiment artifacts**:
+   - Create `results.tsv` if it does not exist.
+   - Ensure `findings/` exists locally.
+   - Both `results.tsv` and `findings/` must remain untracked by git.
+7. **Confirm and go**: once setup looks correct, start the experiment loop.
 
-Once you get confirmation, kick off the experimentation.
+## Benchmark Contract
 
-## Experimentation
+These rules are fixed unless a human explicitly changes them:
 
-Each experiment runs on a single GPU. The training script runs for a **fixed time budget of 5 minutes** (wall clock training time, excluding startup/compilation). You launch it simply as: `uv run train.py`.
+- The raw dataset is `gecko_pool_1s_history.csv`.
+- Missing seconds are **densified** into synthetic 1-second bars.
+- Synthetic bars must use:
+  - `open = previous_close`
+  - `high = previous_close`
+  - `low = previous_close`
+  - `close = previous_close`
+  - `volume = 0`
+- The prediction target is:
+  - `log(close[t+60] / close[t])`
+- Splits are chronological.
+- Purge gaps remain part of the split contract.
+- The newest block remains the untouched final test set.
+- The primary keep/discard metric is **`val_corr`**.
+- The default wall-clock training budget is **10 minutes**.
+- The agent may rerun a promising candidate for up to **20 minutes** by explicitly setting a longer time budget, but should do this sparingly.
+- Do not add dependencies or change repo-wide instructions without human approval.
 
-**What you CAN do:**
-- Modify `train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, training loop, batch size, model size, etc.
+Do not change the benchmark to make numbers look better. Improve the forecaster, not the game.
 
-**What you CANNOT do:**
-- Modify `prepare.py`. It is read-only. It contains the fixed evaluation, data loading, tokenizer, and training constants (time budget, sequence length, etc).
-- Install new packages or add dependencies. You can only use what's already in `pyproject.toml`.
-- Modify the evaluation harness. The `evaluate_bpb` function in `prepare.py` is the ground truth metric.
+## What You May Modify
 
-**The goal is simple: get the lowest val_bpb.** Since the time budget is fixed, you don't need to worry about training time — it's always 5 minutes. Everything is fair game: change the architecture, the optimizer, the hyperparameters, the batch size, the model size. The only constraint is that the code runs without crashing and finishes within the time budget.
+- `train.py`
+  - Model family and architecture.
+  - Hidden size, layer count, dropout, regularization.
+  - Optimizer, LR schedule, batch sizing, and training loop details.
+  - Loss implementation and diagnostics.
+- `prepare.py`
+  - Derived signals from the raw OHLCV bars.
+  - Feature transforms and rolling statistics.
+  - Normalization method, as long as it is fit on train-only data.
+  - Input lookback length and other signal-side knobs.
 
-**VRAM** is a soft constraint. Some increase is acceptable for meaningful val_bpb gains, but it should not blow up dramatically.
+If you modify feature engineering or sequence construction in `prepare.py`, rerun `uv run prepare.py` before the next training run.
 
-**Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win. When evaluating whether to keep a change, weigh the complexity cost against the improvement magnitude. A 0.001 val_bpb improvement that adds 20 lines of hacky code? Probably not worth it. A 0.001 val_bpb improvement from deleting code? Definitely keep. An improvement of ~0 but much simpler code? Keep.
+## What You May Not Modify
 
-**The first run**: Your very first run should always be to establish the baseline, so you will run the training script as is.
+- The raw dataset path or data source.
+- The gap-fill semantics for missing seconds.
+- The target definition.
+- The chronological split semantics.
+- The purge-gap logic as part of the benchmark contract.
+- The primary evaluation metric `val_corr`.
+- `program.md`, `README.md`, or `pyproject.toml` unless a human explicitly asks.
+- Dependencies.
 
-## Output format
+## Goal
 
-Once the script finishes it prints a summary like this:
+The goal is simple: get the **highest `val_corr`** under the configured time budget.
 
-```
+Secondary metrics such as `val_rmse`, `val_mae`, and `val_sign_acc` are for diagnosis and calibration checks. They help you understand *why* a run behaved the way it did, but they do not override the primary keep/discard rule.
+
+Unless there is a clear reason to do otherwise:
+
+- Use the default `10 minute` budget for ordinary exploration runs.
+- Optionally rerun a promising candidate at `15-20 minutes` for confirmation.
+- Do not compare a `10 minute` run directly against a `20 minute` run without noting the different budget in the findings and `results.tsv`.
+
+**Simplicity criterion**: all else equal, simpler is better. A tiny improvement that adds brittle complexity is usually not worth keeping. A similarly good or better result with simpler code is a win.
+
+**The first run** should establish the baseline with the current code:
+
+1. Run `uv run prepare.py` if needed.
+2. Run `uv run train.py` exactly as-is.
+3. Record the baseline before trying ideas.
+
+## Output Format
+
+Each training run prints a summary like:
+
+```text
 ---
-val_bpb:          0.997900
-training_seconds: 300.1
-total_seconds:    325.9
-peak_vram_mb:     45060.2
-mfu_percent:      39.80
-total_tokens_M:   499.6
-num_steps:        953
-num_params_M:     50.3
-depth:            8
+primary_metric:    val_corr
+primary_value:     0.123456
+val_corr:          0.123456
+val_rmse:          0.012345
+val_mae:           0.009876
+val_sign_acc:      0.531250
+last_train_loss:   0.000456
+smooth_train_loss: 0.000512
+last_grad_norm:    3.142857
+time_budget_s:     600
+max_time_budget_s: 1200
+startup_seconds:   1.8
+training_seconds:  600.0
+eval_seconds:      18.4
+total_seconds:     620.2
+avg_samples_sec:   3820.5
+peak_vram_mb:      1420.7
+total_windows_K:   1228.8
+num_steps:         600
+grad_accum_steps:  8
+device_batch_size: 256
+total_batch_size:  2048
+num_params_M:      0.185
+device:            cuda
+feature_dim:       17
+train_samples:     3561212
+val_samples:       763271
+test_samples:      763271
+eval_samples:      131072
+observed_bars:     5055033
+synthetic_bars:    34099
+lookback_bars:     300
+horizon_bars:      60
 ```
 
-Note that the script is configured to always stop after 5 minutes, so depending on the computing platform of this computer the numbers might look different. You can extract the key metric from the log file:
+Extract the key metrics from `run.log` after each run. Higher `val_corr` is better.
 
-```
-grep "^val_bpb:" run.log
-```
+## Logging Results
 
-## Logging results
+Keep a lightweight structured index in `results.tsv` (tab-separated, not comma-separated).
 
-When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-separated — commas break in descriptions).
+Header:
 
-The TSV has a header row and 5 columns:
-
-```
-commit	val_bpb	memory_gb	status	description
+```text
+commit	time_budget_s	training_seconds	val_corr	val_rmse	val_mae	val_sign_acc	memory_gb	status	description	findings_file
 ```
 
-1. git commit hash (short, 7 chars)
-2. val_bpb achieved (e.g. 1.234567) — use 0.000000 for crashes
-3. peak memory in GB, round to .1f (e.g. 12.3 — divide peak_vram_mb by 1024) — use 0.0 for crashes
-4. status: `keep`, `discard`, or `crash`
-5. short text description of what this experiment tried
+Columns:
+
+1. Short git commit hash.
+2. Configured time budget in seconds, such as `600` or `1200`.
+3. Actual `training_seconds` achieved. Use `0.0` for crashes.
+4. `val_corr` achieved. Higher is better. Use `nan` for crashes.
+5. `val_rmse` achieved. Use `nan` for crashes.
+6. `val_mae` achieved. Use `nan` for crashes.
+7. `val_sign_acc` achieved. Use `nan` for crashes.
+8. Peak memory in GB, rounded to one decimal place. Use `0.0` for crashes.
+9. Status: `keep`, `discard`, or `crash`.
+10. Short description of the experiment.
+11. Relative path to the markdown report in `findings/`.
 
 Example:
 
-```
-commit	val_bpb	memory_gb	status	description
-a1b2c3d	0.997900	44.0	keep	baseline
-b2c3d4e	0.993200	44.2	keep	increase LR to 0.04
-c3d4e5f	1.005000	44.0	discard	switch to GeLU activation
-d4e5f6g	0.000000	0.0	crash	double model width (OOM)
+```text
+commit	time_budget_s	training_seconds	val_corr	val_rmse	val_mae	val_sign_acc	memory_gb	status	description	findings_file
+a1b2c3d	600	600.1	0.012300	0.012345	0.009876	0.5312	1.4	keep	baseline lstm findings/2026-03-15-baseline.md
+b2c3d4e	600	600.0	0.018900	0.011980	0.009410	0.5386	1.5	keep	add realized vol features findings/2026-03-15-realized-vol.md
+c3d4e5f	1200	1200.2	0.021400	0.011500	0.009100	0.5410	1.5	keep	confirm promising realized vol run findings/2026-03-15-confirm-realized-vol.md
+d4e5f6g	600	0.0	nan	nan	nan	nan	0.0	crash	bad feature normalization findings/2026-03-15-crash-normalization.md
 ```
 
-## The experiment loop
+## Findings Reports
 
-The experiment runs on a dedicated branch (e.g. `autoresearch/mar5` or `autoresearch/mar5-gpu0`).
+After **every** experiment, create a detailed markdown report under `findings/`, even if the run crashes or is discarded.
+
+Recommended filename format:
+
+```text
+findings/YYYY-MM-DD-short-slug.md
+```
+
+Each report should include:
+
+- `Hypothesis`
+- `Benchmark Contract`
+- `Data And Split`
+- `Signals`
+- `Model`
+- `Training Setup`
+- `Metrics`
+- `Outcome`
+- `Failure Modes`
+- `Next Step`
+
+Prefer adding YAML front matter at the top with fields such as:
+
+- `date`
+- `commit`
+- `status`
+- `val_corr`
+- `val_rmse`
+- `val_mae`
+- `val_sign_acc`
+- `time_budget_s`
+- `description`
+
+Findings must remain local untracked artifacts so they survive discarded code revisions.
+
+## The Experiment Loop
+
+The experiment runs on a dedicated branch such as `autoresearch/mar15`.
 
 LOOP FOREVER:
 
-1. Look at the git state: the current branch/commit we're on
-2. Tune `train.py` with an experimental idea by directly hacking the code.
-3. git commit
-4. Run the experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
-5. Read out the results: `grep "^val_bpb:\|^peak_vram_mb:" run.log`
-6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
-7. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
-8. If val_bpb improved (lower), you "advance" the branch, keeping the git commit
-9. If val_bpb is equal or worse, you git reset back to where you started
+1. Check the current branch and commit.
+2. Decide whether the next idea is:
+   - model-focused
+   - signal-focused
+   - a combined model + signal change
+3. Edit `train.py` and, when justified, the signal-engineering parts of `prepare.py`.
+4. If `prepare.py` changed in a way that affects prepared data, rerun:
+   - `uv run prepare.py`
+5. Commit the tracked code changes.
+6. Run the experiment:
+   - Default screen: `uv run train.py > run.log 2>&1`
+   - Optional confirmation rerun: `uv run train.py --time-budget-seconds 1200 > run.log 2>&1`
+7. Read out the results from `run.log`:
+   - `time_budget_s`
+   - `training_seconds`
+   - `val_corr`
+   - `val_rmse`
+   - `val_mae`
+   - `val_sign_acc`
+   - `peak_vram_mb`
+8. If the metrics are missing, treat the run as a crash and inspect the traceback.
+9. Write the detailed markdown report to `findings/`.
+10. Append the structured result to `results.tsv`.
+11. Compare runs fairly at the same budget whenever possible.
+12. If a `10 minute` run is promising, you may rerun it at up to `20 minutes` to confirm the signal before deciding whether to keep it.
+13. If `val_corr` improved on a fair comparison, keep the change.
+14. If `val_corr` is worse or equal, restore the tracked code to the last kept commit, but keep the local findings and result logs.
 
-The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
+## Crash Handling
 
-**Timeout**: Each experiment should take ~5 minutes total (+ a few seconds for startup and eval overhead). If a run exceeds 10 minutes, kill it and treat it as a failure (discard and revert).
+If a run crashes:
 
-**Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
+- If the issue is trivial and clearly fixable, fix it and rerun.
+- If the idea itself is broken, log it as `crash`, write the findings report, and move on.
 
-**NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read papers referenced in the code, re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period.
+## Timeout
 
-As an example use case, a user might leave you running while they sleep. If each experiment takes you ~5 minutes then you can run approx 12/hour, for a total of about 100 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept!
+Each experiment should take about 10 minutes of training time by default, or up to 20 minutes for an explicit confirmation rerun, plus startup and evaluation overhead. If a run goes meaningfully beyond its configured budget and is clearly hung, stop it, log the failure, and move on.
+
+## Never Stop
+
+Once the experiment loop begins, do not pause to ask the human if you should continue. Keep iterating until explicitly interrupted.

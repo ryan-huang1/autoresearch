@@ -18,6 +18,9 @@ AGENTS.md
 
 # Experimental code/artifacts
 dev/
+findings/
+run.log
+gecko_pool_1s_history.csv
 
 # Results file
 results.tsv
