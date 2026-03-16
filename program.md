@@ -56,6 +56,7 @@ Do not change the benchmark to make numbers look better. Improve the forecaster,
 
 - `train.py`
   - Model family and architecture.
+  - Learned feature extraction / representation learning inside the model from the allowed input window.
   - Hidden size, layer count, dropout, regularization.
   - Optimizer, LR schedule, batch sizing, and training loop details.
   - Loss implementation and diagnostics.
@@ -66,6 +67,12 @@ Do not change the benchmark to make numbers look better. Improve the forecaster,
   - Input lookback length and other signal-side knobs.
 
 If you modify feature engineering or sequence construction in `prepare.py`, rerun `uv run prepare.py` before the next training run.
+
+Clarification:
+
+- If you change the prepared input columns, rolling computations, normalization, or sequence-construction contract, do it in `prepare.py`.
+- If the model in `train.py` learns its own transformations of the existing input window, that is allowed.
+- Learned feature extraction must not use future information, alter the benchmark contract, or introduce train/val/test leakage.
 
 ## What You May Not Modify
 
