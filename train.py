@@ -57,7 +57,7 @@ FINAL_LR_FRAC = 0.10
 GRAD_CLIP_NORM = 1.0
 LOSS_NAME = "huber"  # "huber" or "mse"
 HUBER_DELTA = 0.01
-CORR_LOSS_WEIGHT = 0.0
+CORR_LOSS_WEIGHT = 3e-4
 SEED = 42
 
 
