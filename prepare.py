@@ -41,17 +41,24 @@ FEATURE_NAMES = (
     "log_return_5",
     "log_return_15",
     "log_return_60",
+    "log_return_300",
+    "log_return_900",
     "body_frac",
     "range_frac",
     "upper_wick_frac",
     "lower_wick_frac",
     "close_vs_sma_60",
     "close_vs_sma_300",
+    "close_vs_sma_900",
     "volume_zscore_60",
+    "volume_zscore_300",
     "realized_vol_60",
     "realized_vol_300",
+    "realized_vol_900",
+    "vol_ratio_60_300",
     "log_seconds_since_trade",
     "is_synthetic_bar",
+    "synthetic_frac_60",
 )
 
 # ---------------------------------------------------------------------------
@@ -59,7 +66,7 @@ FEATURE_NAMES = (
 # ---------------------------------------------------------------------------
 
 LOOKBACK_BARS = 300
-FEATURE_WINDOWS = (10, 60, 300)
+FEATURE_WINDOWS = (10, 60, 300, 900)
 
 # Derived from the benchmark contract plus the current signal settings.
 FEATURE_WARMUP_BARS = max(FEATURE_WINDOWS)
@@ -335,6 +342,8 @@ def generate_feature_columns(dense_bars):
     yield "log_return_5", lagged_difference(log_close, 5)
     yield "log_return_15", lagged_difference(log_close, 15)
     yield "log_return_60", lagged_difference(log_close, 60)
+    yield "log_return_300", lagged_difference(log_close, 300)
+    yield "log_return_900", lagged_difference(log_close, 900)
     yield "body_frac", ((close - open_) / safe_open).astype(np.float32)
     yield "range_frac", ((high - low) / safe_close).astype(np.float32)
     yield "upper_wick_frac", ((high - np.maximum(open_, close)) / safe_close).astype(np.float32)
@@ -342,16 +351,30 @@ def generate_feature_columns(dense_bars):
 
     close_sma_60 = rolling_mean(close, 60)
     close_sma_300 = rolling_mean(close, 300)
+    close_sma_900 = rolling_mean(close, 900)
     yield "close_vs_sma_60", ((close / np.maximum(close_sma_60, EPS)) - 1.0).astype(np.float32)
     yield "close_vs_sma_300", ((close / np.maximum(close_sma_300, EPS)) - 1.0).astype(np.float32)
+    yield "close_vs_sma_900", ((close / np.maximum(close_sma_900, EPS)) - 1.0).astype(np.float32)
 
     volume_mean_60 = rolling_mean(log_volume, 60)
     volume_std_60 = rolling_std(log_volume, 60)
+    volume_mean_300 = rolling_mean(log_volume, 300)
+    volume_std_300 = rolling_std(log_volume, 300)
+    realized_vol_60 = rolling_std(realized_vol_input, 60)
+    realized_vol_300 = rolling_std(realized_vol_input, 300)
+    realized_vol_900 = rolling_std(realized_vol_input, 900)
+    synthetic_frac_60 = rolling_mean(1.0 - observed, 60)
     yield "volume_zscore_60", safe_zscore(log_volume, volume_mean_60, volume_std_60).astype(np.float32)
-    yield "realized_vol_60", rolling_std(realized_vol_input, 60)
-    yield "realized_vol_300", rolling_std(realized_vol_input, 300)
+    yield "volume_zscore_300", safe_zscore(log_volume, volume_mean_300, volume_std_300).astype(np.float32)
+    yield "realized_vol_60", realized_vol_60
+    yield "realized_vol_300", realized_vol_300
+    yield "realized_vol_900", realized_vol_900
+    yield "vol_ratio_60_300", (
+        (realized_vol_60 / np.maximum(realized_vol_300, MIN_STD)) - 1.0
+    ).astype(np.float32)
     yield "log_seconds_since_trade", np.log1p(seconds_since_trade).astype(np.float32)
     yield "is_synthetic_bar", (1.0 - observed).astype(np.float32)
+    yield "synthetic_frac_60", synthetic_frac_60.astype(np.float32)
 
 
 def write_prepared_arrays(dense_bars, splits, output_dir):
