@@ -1,5 +1,5 @@
 """
-Autoresearch time-series regression baseline.
+Autoresearch time-series regression with a causal TCN.
 
 Usage:
     uv run train.py
@@ -36,23 +36,25 @@ from prepare import (
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
 # ---------------------------------------------------------------------------
-# Model and training knobs (future agents may modify these)
+# Model and training knobs
 # ---------------------------------------------------------------------------
 
 # Model
 HIDDEN_SIZE = 128
-NUM_LAYERS = 2
+NUM_LAYERS = 5
 DROPOUT = 0.10
+KERNEL_SIZE = 7
+NORM_GROUPS = 8
 
 # Optimization
-DEVICE_BATCH_SIZE = 256
+DEVICE_BATCH_SIZE = 512
 TOTAL_BATCH_SIZE = 2048
-LEARNING_RATE = 1e-4
+LEARNING_RATE = 2e-4
 WEIGHT_DECAY = 1e-4
 ADAM_BETAS = (0.9, 0.95)
 WARMUP_RATIO = 0.05
 FINAL_LR_FRAC = 0.10
-GRAD_CLIP_NORM = 0.5
+GRAD_CLIP_NORM = 1.0
 LOSS_NAME = "huber"  # "huber" or "mse"
 HUBER_DELTA = 0.01
 SEED = 42
@@ -68,6 +70,8 @@ class ModelConfig:
     hidden_size: int = HIDDEN_SIZE
     num_layers: int = NUM_LAYERS
     dropout: float = DROPOUT
+    kernel_size: int = KERNEL_SIZE
+    norm_groups: int = NORM_GROUPS
 
 
 @dataclass
@@ -89,47 +93,104 @@ class TrainConfig:
 # Model
 # ---------------------------------------------------------------------------
 
-class LSTMRegressor(nn.Module):
+def make_group_norm(num_channels, max_groups):
+    num_groups = min(max_groups, num_channels)
+    while num_groups > 1 and num_channels % num_groups != 0:
+        num_groups -= 1
+    return nn.GroupNorm(num_groups, num_channels)
+
+
+class ResidualTemporalBlock(nn.Module):
+    def __init__(self, channels, kernel_size, dilation, dropout, norm_groups):
+        super().__init__()
+        padding = (kernel_size - 1) * dilation
+        self.trim = padding
+        self.conv1 = nn.Conv1d(
+            channels,
+            channels,
+            kernel_size=kernel_size,
+            dilation=dilation,
+            padding=padding,
+        )
+        self.norm1 = make_group_norm(channels, norm_groups)
+        self.conv2 = nn.Conv1d(
+            channels,
+            channels,
+            kernel_size=kernel_size,
+            dilation=dilation,
+            padding=padding,
+        )
+        self.norm2 = make_group_norm(channels, norm_groups)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        residual = x
+        x = self.conv1(x)
+        if self.trim > 0:
+            x = x[:, :, :-self.trim]
+        x = self.norm1(x)
+        x = F.gelu(x)
+        x = self.dropout(x)
+
+        x = self.conv2(x)
+        if self.trim > 0:
+            x = x[:, :, :-self.trim]
+        x = self.norm2(x)
+        x = self.dropout(x)
+        return F.gelu(x + residual)
+
+
+class TCNRegressor(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
         self.input_norm = nn.LayerNorm(config.input_dim)
-        self.encoder = nn.LSTM(
-            input_size=config.input_dim,
-            hidden_size=config.hidden_size,
-            num_layers=config.num_layers,
-            dropout=config.dropout if config.num_layers > 1 else 0.0,
-            batch_first=True,
+        self.input_proj = nn.Conv1d(config.input_dim, config.hidden_size, kernel_size=1)
+        self.input_proj_norm = make_group_norm(config.hidden_size, config.norm_groups)
+        self.blocks = nn.ModuleList(
+            [
+                ResidualTemporalBlock(
+                    channels=config.hidden_size,
+                    kernel_size=config.kernel_size,
+                    dilation=2**layer_idx,
+                    dropout=config.dropout,
+                    norm_groups=config.norm_groups,
+                )
+                for layer_idx in range(config.num_layers)
+            ]
         )
+        summary_dim = config.hidden_size * 2
         self.head = nn.Sequential(
-            nn.LayerNorm(config.hidden_size),
-            nn.Linear(config.hidden_size, config.hidden_size),
-            nn.SiLU(),
+            nn.LayerNorm(summary_dim),
+            nn.Linear(summary_dim, config.hidden_size),
+            nn.GELU(),
             nn.Dropout(config.dropout),
             nn.Linear(config.hidden_size, 1),
         )
         self.reset_parameters()
 
     def reset_parameters(self):
-        for name, param in self.encoder.named_parameters():
-            if "weight_ih" in name:
-                nn.init.xavier_uniform_(param)
-            elif "weight_hh" in name:
-                nn.init.orthogonal_(param)
-            elif "bias" in name:
-                nn.init.zeros_(param)
-                hidden = param.numel() // 4
-                param.data[hidden : 2 * hidden].fill_(1.0)
-        for module in self.head:
-            if isinstance(module, nn.Linear):
+        for module in self.modules():
+            if isinstance(module, nn.Conv1d):
+                nn.init.kaiming_normal_(module.weight, nonlinearity="linear")
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
                 nn.init.zeros_(module.bias)
 
     def forward(self, x):
         x = self.input_norm(x)
-        sequence, _ = self.encoder(x)
-        last_hidden = sequence[:, -1, :]
-        prediction = self.head(last_hidden)
+        x = x.transpose(1, 2)
+        x = self.input_proj(x)
+        x = self.input_proj_norm(x)
+        x = F.gelu(x)
+        for block in self.blocks:
+            x = block(x)
+        last_state = x[:, :, -1]
+        pooled_state = x.mean(dim=2)
+        summary = torch.cat((last_state, pooled_state), dim=1)
+        prediction = self.head(summary)
         return prediction.squeeze(-1)
 
 
@@ -154,7 +215,7 @@ def get_autocast_context(device):
 
 
 def build_model(model_config):
-    return LSTMRegressor(model_config)
+    return TCNRegressor(model_config)
 
 
 def build_optimizer(model, train_config):
@@ -240,6 +301,8 @@ def validate_prepared_input(dataset):
 def maybe_sync(device):
     if device.type == "cuda":
         torch.cuda.synchronize()
+    elif device.type == "mps" and hasattr(torch, "mps") and hasattr(torch.mps, "synchronize"):
+        torch.mps.synchronize()
 
 
 def train_one_run(model, dataset, optimizer, train_config, device, time_budget_seconds):
@@ -281,9 +344,10 @@ def train_one_run(model, dataset, optimizer, train_config, device, time_budget_s
         step += 1
 
         train_loss_value = float(train_loss.item())
+        grad_norm_value = float(grad_norm)
         last_train_loss_value = train_loss_value
-        last_grad_norm_value = float(grad_norm)
-        if math.isnan(train_loss_value) or train_loss_value > 100:
+        last_grad_norm_value = grad_norm_value
+        if not math.isfinite(train_loss_value) or not math.isfinite(grad_norm_value) or train_loss_value > 100:
             raise RuntimeError("Training diverged.")
 
         ema_beta = 0.9
@@ -296,7 +360,7 @@ def train_one_run(model, dataset, optimizer, train_config, device, time_budget_s
             f"\rstep {step:05d} ({pct_done:5.1f}%) | "
             f"loss: {debiased_smooth_loss:.6f} | "
             f"lr_mult: {lr_multiplier:.3f} | "
-            f"grad_norm: {float(grad_norm):.3f} | "
+            f"grad_norm: {grad_norm_value:.3f} | "
             f"samples/s: {samples_per_second:,} | "
             f"remaining: {remaining:6.1f}s    ",
             end="",
@@ -328,7 +392,7 @@ def train_one_run(model, dataset, optimizer, train_config, device, time_budget_s
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train an LSTM baseline on prepared SOL time-series data.")
+    parser = argparse.ArgumentParser(description="Train a causal TCN on prepared SOL time-series data.")
     parser.add_argument(
         "--prepared-dir",
         type=str,
