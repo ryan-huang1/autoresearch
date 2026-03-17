@@ -235,11 +235,12 @@ These rules are fixed unless a human explicitly changes them:
 - The prediction target is:
   - `log(close[t+3] / close[t])`
 - Splits are chronological.
-- Training uses a fixed-width rolling window of recent history rather than the full past.
+- The newest block remains the untouched anchored final test set.
+- Validation uses walk-forward folds immediately before the test block.
+- Each walk-forward fold trains only on history available before that fold, with purge gaps preserved.
 - Purge gaps remain part of the split contract.
-- The newest block remains the untouched final test set.
 - The primary keep/discard metric is **`val_corr`**.
-- A good default wall-clock training budget is **600 seconds**, but the agent may choose the training budget for any experiment when justified.
+- The agent chooses the wall-clock training budget for each experiment.
 - In general, prefer shorter runs for faster iteration loops, but run long enough to get reliable results and useful insight.
 - Do not add dependencies or change repo-wide instructions without human approval.
 
@@ -310,7 +311,7 @@ Unless there is a clear reason to do otherwise:
 **The first run** should establish the baseline with the current code:
 
 1. Run `uv run prepare.py`.
-2. Run `uv run train.py` exactly as-is.
+2. Choose an explicit training budget and run `uv run train.py --time-budget-seconds <seconds>`.
 3. Record the baseline before trying ideas.
 
 ## Output Format
@@ -339,12 +340,16 @@ peak_vram_mb:      1420.7
 total_windows_K:   1228.8
 num_steps:         1200
 grad_accum_steps:  4
+split_strategy:    anchored_test_walk_forward_val
+num_val_folds:     3
+fold_budgets_s:    200,200,200
 device_batch_size: 512
 total_batch_size:  2048
 num_params_M:      0.185
 device:            cuda
 feature_dim:       42
 train_samples:     366000
+max_train_samples: 418000
 val_samples:       78300
 test_samples:      78300
 eval_samples:      78300
@@ -352,7 +357,12 @@ observed_bars:     520138
 synthetic_bars:    5462
 lookback_bars:     300
 horizon_bars:      3
+fold1_val_corr:    0.101010
+fold2_val_corr:    0.123456
+fold3_val_corr:    0.118118
 ```
+
+The `val_*` metrics above are the aggregate out-of-sample walk-forward validation metrics across all validation folds. The final test block remains untouched during experiment selection.
 
 Extract the key metrics from `run.log` after each run. Higher `val_corr` is better.
 
@@ -439,8 +449,7 @@ LOOP FOREVER:
    - `uv run prepare.py`
 6. Commit the tracked code changes.
 7. Run the experiment on the remote GPU machine:
-   - Default screen: `uv run train.py > run.log 2>&1`
-   - Custom budget run: `uv run train.py --time-budget-seconds <seconds> > run.log 2>&1`
+   - Run with an explicit budget: `uv run train.py --time-budget-seconds <seconds> > run.log 2>&1`
 8. Read out the results from `run.log`:
    - `time_budget_s`
    - `training_seconds`
@@ -459,7 +468,7 @@ LOOP FOREVER:
 
 ## Timeout
 
-The agent may choose the training budget for any experiment. In general, prefer shorter runs so you can complete more iteration loops and improve the model faster, but make sure each run is long enough to produce good results and useful insight. Use `--time-budget-seconds <seconds>` whenever a custom duration is warranted. If a run goes meaningfully beyond its configured budget and is clearly hung, stop it, log the failure, and move on.
+The agent may choose the training budget for any experiment. In general, prefer shorter runs so you can complete more iteration loops and improve the model faster, but make sure each run is long enough to produce good results and useful insight. Pass `--time-budget-seconds <seconds>` on every training run. If a run goes meaningfully beyond its configured budget and is clearly hung, stop it, log the failure, and move on.
 
 Crashes: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
 

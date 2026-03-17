@@ -2,7 +2,7 @@
 Autoresearch Orca minute-level regression with a causal TCN.
 
 Usage:
-    uv run train.py
+    uv run train.py --time-budget-seconds 600
     uv run train.py --time-budget-seconds 1200
 """
 
@@ -28,16 +28,18 @@ from prepare import (
     HORIZON_BARS,
     LOOKBACK_BARS,
     MAX_TIME_BUDGET,
+    NUM_VAL_FOLDS,
     PREPARED_DIR,
     PREPARED_VERSION,
     PRIMARY_METRIC,
     PURGE_BARS,
     SPLIT_STRATEGY,
     SOURCE_KIND,
-    TIME_BUDGET,
-    evaluate_regression,
     load_prepared_dataset,
-    sample_batch,
+    predict_regression_range,
+    regression_metrics,
+    sample_batch_range,
+    scaler_arrays_from_info,
 )
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
@@ -223,6 +225,13 @@ def get_autocast_context(device):
     return nullcontext()
 
 
+def seed_everything(seed, device):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed(seed)
+
+
 def build_model(model_config):
     return TCNRegressor(model_config)
 
@@ -269,19 +278,28 @@ def compute_loss(predictions, targets, train_config):
     return base_loss + train_config.corr_loss_weight * (1.0 - corr)
 
 
-def evaluate(model, dataset, batch_size, device):
-    model.eval()
-    metrics = evaluate_regression(
-        model,
-        dataset,
-        split="val",
-        batch_size=batch_size,
-        device=device,
-        autocast_ctx=get_autocast_context(device),
-        max_samples=EVAL_SAMPLES,
-    )
-    model.train()
-    return metrics
+def allocate_fold_budgets(total_budget_seconds, num_folds):
+    if total_budget_seconds < num_folds:
+        raise ValueError(
+            f"time budget {total_budget_seconds}s must be at least {num_folds}s for walk-forward validation."
+        )
+    base_budget = total_budget_seconds // num_folds
+    remainder = total_budget_seconds % num_folds
+    return [base_budget + (1 if fold_idx < remainder else 0) for fold_idx in range(num_folds)]
+
+
+def allocate_eval_limits(validation_folds, max_eval_samples):
+    total_val_samples = sum(int(fold["val_stop"]) - int(fold["val_start"]) for fold in validation_folds)
+    if max_eval_samples is None or max_eval_samples >= total_val_samples:
+        return [None] * len(validation_folds)
+    if max_eval_samples < len(validation_folds):
+        raise ValueError(
+            f"eval_samples {max_eval_samples} must be at least the number of validation folds "
+            f"({len(validation_folds)})."
+        )
+    base_limit = max_eval_samples // len(validation_folds)
+    remainder = max_eval_samples % len(validation_folds)
+    return [base_limit + (1 if fold_idx < remainder else 0) for fold_idx in range(len(validation_folds))]
 
 
 def count_parameters(model):
@@ -318,6 +336,8 @@ def validate_prepared_input(dataset):
     actual_horizon_bars = dataset.metadata.get("horizon_bars")
     actual_purge_bars = dataset.metadata.get("purge_bars")
     actual_split_strategy = dataset.metadata.get("split_strategy")
+    actual_num_val_folds = dataset.metadata.get("num_val_folds")
+    actual_validation_folds = dataset.metadata.get("validation_folds") or []
 
     mismatches = []
     if actual_version != PREPARED_VERSION:
@@ -344,6 +364,12 @@ def validate_prepared_input(dataset):
         mismatches.append(
             f"split_strategy expected {SPLIT_STRATEGY!r} but found {actual_split_strategy!r}"
         )
+    if actual_num_val_folds != NUM_VAL_FOLDS:
+        mismatches.append(f"num_val_folds expected {NUM_VAL_FOLDS} but found {actual_num_val_folds!r}")
+    if len(actual_validation_folds) != NUM_VAL_FOLDS:
+        mismatches.append(
+            f"validation_folds expected {NUM_VAL_FOLDS} entries but found {len(actual_validation_folds)!r}"
+        )
 
     if mismatches:
         details = "\n".join(f"- {item}" for item in mismatches)
@@ -361,7 +387,19 @@ def maybe_sync(device):
         torch.mps.synchronize()
 
 
-def train_one_run(model, dataset, optimizer, train_config, device, time_budget_seconds):
+def train_one_run(
+    model,
+    dataset,
+    optimizer,
+    train_config,
+    device,
+    time_budget_seconds,
+    sample_start,
+    sample_stop,
+    scaler_mean=None,
+    scaler_std=None,
+    progress_label="train",
+):
     if train_config.total_batch_size % train_config.device_batch_size != 0:
         raise ValueError("TOTAL_BATCH_SIZE must be divisible by DEVICE_BATCH_SIZE.")
 
@@ -384,7 +422,16 @@ def train_one_run(model, dataset, optimizer, train_config, device, time_budget_s
         optimizer.zero_grad(set_to_none=True)
 
         for _ in range(grad_accum_steps):
-            x, y = sample_batch(dataset, "train", train_config.device_batch_size, device, rng)
+            x, y = sample_batch_range(
+                dataset,
+                sample_start,
+                sample_stop,
+                train_config.device_batch_size,
+                device,
+                rng,
+                scaler_mean=scaler_mean,
+                scaler_std=scaler_std,
+            )
             with get_autocast_context(device):
                 predictions = model(x)
                 loss = compute_loss(predictions, y, train_config)
@@ -413,7 +460,7 @@ def train_one_run(model, dataset, optimizer, train_config, device, time_budget_s
         remaining = max(0.0, time_budget_seconds - total_training_time)
         pct_done = 100.0 * progress
         print(
-            f"\rstep {step:05d} ({pct_done:5.1f}%) | "
+            f"\r{progress_label} step {step:05d} ({pct_done:5.1f}%) | "
             f"loss: {debiased_smooth_loss:.6f} | "
             f"lr_mult: {lr_multiplier:.3f} | "
             f"grad_norm: {grad_norm_value:.3f} | "
@@ -447,6 +494,114 @@ def train_one_run(model, dataset, optimizer, train_config, device, time_budget_s
     }
 
 
+def run_walk_forward_validation(model_config, dataset, train_config, device, time_budget_seconds):
+    validation_folds = dataset.metadata["validation_folds"]
+    fold_budgets = allocate_fold_budgets(time_budget_seconds, len(validation_folds))
+    eval_limits = allocate_eval_limits(validation_folds, EVAL_SAMPLES)
+
+    fold_summaries = []
+    prediction_chunks = []
+    target_chunks = []
+    total_training_seconds = 0.0
+    total_eval_seconds = 0.0
+    total_windows = 0
+    total_steps = 0
+    final_run_stats = None
+
+    for fold_idx, (fold_info, fold_budget, eval_limit) in enumerate(
+        zip(validation_folds, fold_budgets, eval_limits)
+    ):
+        fold_label = f"fold {fold_idx + 1}/{len(validation_folds)}"
+        train_samples = int(fold_info["train_stop"]) - int(fold_info["train_start"])
+        val_samples = int(fold_info["val_stop"]) - int(fold_info["val_start"])
+        print(
+            f"{fold_label}: train {train_samples:,} samples | "
+            f"val {val_samples:,} samples | budget {fold_budget}s"
+        )
+
+        seed_everything(train_config.seed, device)
+        model = build_model(model_config).to(device)
+        optimizer = build_optimizer(model, train_config)
+        scaler_mean, scaler_std = scaler_arrays_from_info(fold_info["scaler"])
+
+        fold_run_stats = train_one_run(
+            model,
+            dataset,
+            optimizer,
+            train_config,
+            device,
+            fold_budget,
+            sample_start=fold_info["train_start"],
+            sample_stop=fold_info["train_stop"],
+            scaler_mean=scaler_mean,
+            scaler_std=scaler_std,
+            progress_label=fold_label,
+        )
+
+        t_eval_start = time.time()
+        predictions, targets = predict_regression_range(
+            model,
+            dataset,
+            fold_info["val_start"],
+            fold_info["val_stop"],
+            train_config.device_batch_size,
+            device,
+            autocast_ctx=get_autocast_context(device),
+            max_samples=eval_limit,
+            scaler_mean=scaler_mean,
+            scaler_std=scaler_std,
+        )
+        fold_eval_seconds = time.time() - t_eval_start
+        fold_metrics = regression_metrics(predictions, targets)
+        print(
+            f"{fold_label} val_corr: {fold_metrics['corr']:.6f} | "
+            f"val_rmse: {fold_metrics['rmse']:.6f} | "
+            f"val_mae: {fold_metrics['mae']:.6f} | "
+            f"val_sign_acc: {fold_metrics['sign_accuracy']:.6f}"
+        )
+
+        fold_summaries.append(
+            {
+                "fold": int(fold_info["fold"]),
+                "train_samples": train_samples,
+                "val_samples": val_samples,
+                "eval_samples": int(len(targets)),
+                "budget_seconds": int(fold_budget),
+                "training_seconds": float(fold_run_stats["training_seconds"]),
+                "eval_seconds": float(fold_eval_seconds),
+                "metrics": fold_metrics,
+            }
+        )
+        prediction_chunks.append(predictions)
+        target_chunks.append(targets)
+        total_training_seconds += float(fold_run_stats["training_seconds"])
+        total_eval_seconds += float(fold_eval_seconds)
+        total_windows += int(fold_run_stats["total_windows"])
+        total_steps += int(fold_run_stats["num_steps"])
+        final_run_stats = fold_run_stats
+
+        del model, optimizer
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    all_predictions = np.concatenate(prediction_chunks)
+    all_targets = np.concatenate(target_chunks)
+    aggregate_metrics = regression_metrics(all_predictions, all_targets)
+    aggregate_stats = {
+        "training_seconds": total_training_seconds,
+        "num_steps": total_steps,
+        "total_windows": total_windows,
+        "avg_samples_per_second": total_windows / max(total_training_seconds, 1e-6),
+        "last_train_loss": final_run_stats["last_train_loss"],
+        "smoothed_train_loss": final_run_stats["smoothed_train_loss"],
+        "last_grad_norm": final_run_stats["last_grad_norm"],
+        "grad_accum_steps": final_run_stats["grad_accum_steps"],
+        "fold_budgets": fold_budgets,
+    }
+    return aggregate_metrics, aggregate_stats, fold_summaries, total_eval_seconds
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train a causal TCN on prepared Orca minute time-series data.")
     parser.add_argument(
@@ -464,24 +619,30 @@ def main():
     parser.add_argument(
         "--time-budget-seconds",
         type=int,
-        default=TIME_BUDGET,
-        help=f"Training time budget in seconds. Default {TIME_BUDGET}, max {MAX_TIME_BUDGET}.",
+        required=True,
+        help=(
+            "Training time budget in seconds. "
+            f"Required for each run, max {MAX_TIME_BUDGET}."
+        ),
     )
     args = parser.parse_args()
 
     t_start = time.time()
     time_budget_seconds = resolve_time_budget_seconds(args.time_budget_seconds)
     device = resolve_device(args.device)
-    torch.manual_seed(SEED)
+    seed_everything(SEED, device)
     if device.type == "cuda":
-        torch.cuda.manual_seed(SEED)
         torch.backends.cudnn.benchmark = True
+        torch.cuda.reset_peak_memory_stats()
     torch.set_float32_matmul_precision("high")
 
     dataset = load_prepared_dataset(args.prepared_dir)
     validate_prepared_input(dataset)
     model_config = ModelConfig(input_dim=dataset.input_dim)
     train_config = TrainConfig()
+    probe_model = build_model(model_config)
+    num_params = count_parameters(probe_model)
+    del probe_model
 
     print(f"Device: {device}")
     print(f"Prepared dir: {os.path.abspath(args.prepared_dir)}")
@@ -489,18 +650,19 @@ def main():
     print(f"Time budget seconds: {time_budget_seconds}")
     print(f"Feature dim: {dataset.input_dim}")
     print(f"Lookback bars: {dataset.metadata['lookback_bars']}")
+    print(f"Split strategy: {dataset.metadata['split_strategy']}")
+    print(f"Validation folds: {dataset.metadata['num_val_folds']}")
     print(f"Model config: {asdict(model_config)}")
     print(f"Train config: {asdict(train_config)}")
 
-    model = build_model(model_config).to(device)
-    optimizer = build_optimizer(model, train_config)
-    num_params = count_parameters(model)
-
     t_training_start = time.time()
-    run_stats = train_one_run(model, dataset, optimizer, train_config, device, time_budget_seconds)
-    t_eval_start = time.time()
-    val_metrics = evaluate(model, dataset, train_config.device_batch_size, device)
-    eval_seconds = time.time() - t_eval_start
+    val_metrics, run_stats, fold_summaries, eval_seconds = run_walk_forward_validation(
+        model_config,
+        dataset,
+        train_config,
+        device,
+        time_budget_seconds,
+    )
 
     t_end = time.time()
     peak_vram_mb = (
@@ -509,7 +671,8 @@ def main():
     startup_seconds = t_training_start - t_start
     primary_value = get_primary_metric_value(val_metrics)
     splits = dataset.metadata["splits"]
-    eval_samples = min(EVAL_SAMPLES, splits["val"]["num_samples"])
+    eval_samples = sum(fold_summary["eval_samples"] for fold_summary in fold_summaries)
+    max_train_samples = max(fold_summary["train_samples"] for fold_summary in fold_summaries)
 
     print("---")
     print(f"primary_metric:    {PRIMARY_METRIC}")
@@ -532,12 +695,16 @@ def main():
     print(f"total_windows_K:   {run_stats['total_windows'] / 1e3:.1f}")
     print(f"num_steps:         {run_stats['num_steps']}")
     print(f"grad_accum_steps:  {run_stats['grad_accum_steps']}")
+    print(f"split_strategy:    {dataset.metadata['split_strategy']}")
+    print(f"num_val_folds:     {len(fold_summaries)}")
+    print(f"fold_budgets_s:    {','.join(str(budget) for budget in run_stats['fold_budgets'])}")
     print(f"device_batch_size: {train_config.device_batch_size}")
     print(f"total_batch_size:  {train_config.total_batch_size}")
     print(f"num_params_M:      {num_params / 1e6:.3f}")
     print(f"device:            {device}")
     print(f"feature_dim:       {dataset.input_dim}")
     print(f"train_samples:     {splits['train']['num_samples']}")
+    print(f"max_train_samples: {max_train_samples}")
     print(f"val_samples:       {splits['val']['num_samples']}")
     print(f"test_samples:      {splits['test']['num_samples']}")
     print(f"eval_samples:      {eval_samples}")
@@ -545,6 +712,9 @@ def main():
     print(f"synthetic_bars:    {dataset.metadata['num_synthetic_rows']}")
     print(f"lookback_bars:     {dataset.metadata['lookback_bars']}")
     print(f"horizon_bars:      {dataset.metadata['horizon_bars']}")
+    for fold_summary in fold_summaries:
+        fold_name = fold_summary["fold"] + 1
+        print(f"fold{fold_name}_val_corr:   {fold_summary['metrics']['corr']:.6f}")
 
 
 if __name__ == "__main__":

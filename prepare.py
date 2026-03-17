@@ -28,20 +28,18 @@ import torch
 # Fixed benchmark contract (only change with explicit human approval)
 # ---------------------------------------------------------------------------
 
-PREPARED_VERSION = 3
-TIME_BUDGET = 600
+PREPARED_VERSION = 4
 MAX_TIME_BUDGET = 1_200
 BAR_SECONDS = 60
 HORIZON_BARS = 3
 VAL_RATIO = 0.15
 TEST_RATIO = 0.15
-TRAIN_WINDOW_RATIO = 0.50
 NUM_VAL_FOLDS = 3
 EVAL_SAMPLES = 131_072
 PRIMARY_METRIC = "val_corr"
 PRIMARY_METRIC_DIRECTION = "higher_is_better"
 SOURCE_KIND = "orca_parquet_dir"
-SPLIT_STRATEGY = "rolling_window"
+SPLIT_STRATEGY = "anchored_test_walk_forward_val"
 FEATURE_NAMES = (
     "log_close",
     "log_volume",
@@ -491,7 +489,6 @@ def build_splits(num_rows, dense_start_time):
         raise ValueError("Dataset is too short for the configured lookback, horizon, and features.")
 
     usable_samples = max_sample_end - min_sample_end
-    train_len = max(1, int(usable_samples * TRAIN_WINDOW_RATIO))
     val_len = max(1, int(usable_samples * VAL_RATIO))
     test_len = max(1, int(usable_samples * TEST_RATIO))
 
@@ -499,12 +496,11 @@ def build_splits(num_rows, dense_start_time):
     val_stop = test_start - PURGE_BARS
     val_start = val_stop - val_len
     train_stop = val_start - PURGE_BARS
-    train_start = max(min_sample_end, train_stop - train_len)
-    if train_stop <= train_start:
+    if train_stop <= min_sample_end:
         raise ValueError("Not enough room for train/val/test splits after purge gaps.")
 
     splits = {
-        "train": {"sample_start": int(train_start), "sample_stop": int(train_stop)},
+        "train": {"sample_start": int(min_sample_end), "sample_stop": int(train_stop)},
         "val": {"sample_start": int(val_start), "sample_stop": int(val_stop)},
         "test": {"sample_start": int(test_start), "sample_stop": int(max_sample_end)},
     }
@@ -522,17 +518,16 @@ def build_splits(num_rows, dense_start_time):
             splits["val"]["sample_stop"], fold_start + fold_len
         )
         fold_train_stop = fold_start - PURGE_BARS
-        fold_train_start = max(min_sample_end, fold_train_stop - train_len)
-        if fold_train_stop <= fold_train_start:
+        if fold_train_stop <= min_sample_end:
             break
         validation_folds.append(
             {
                 "fold": fold_idx,
-                "train_start": int(fold_train_start),
+                "train_start": int(min_sample_end),
                 "train_stop": int(fold_train_stop),
                 "val_start": int(fold_start),
                 "val_stop": int(fold_stop),
-                "train_timestamp_start": dense_start_time + int(fold_train_start) * BAR_SECONDS,
+                "train_timestamp_start": dense_start_time + int(min_sample_end) * BAR_SECONDS,
                 "train_timestamp_stop": dense_start_time + (int(fold_train_stop) - 1) * BAR_SECONDS,
                 "val_timestamp_start": dense_start_time + int(fold_start) * BAR_SECONDS,
                 "val_timestamp_stop": dense_start_time + (int(fold_stop) - 1) * BAR_SECONDS,
@@ -634,7 +629,27 @@ def generate_feature_columns(dense_bars):
     yield "daily_log_liquidity_change_1d", dense_bars["daily_log_liquidity_change_1d"].astype(np.float32)
 
 
-def write_prepared_arrays(dense_bars, splits, output_dir):
+def scaler_row_bounds(train_start, train_stop):
+    row_start = max(FEATURE_WARMUP_BARS - 1, int(train_start) - LOOKBACK_BARS + 1)
+    row_stop = int(train_stop)
+    if row_stop <= row_start:
+        raise ValueError("Not enough rows for scaler fitting.")
+    return row_start, row_stop
+
+
+def compute_scaler(values, row_start, row_stop):
+    train_slice = np.asarray(values[row_start:row_stop], dtype=np.float64)
+    finite_values = train_slice[np.isfinite(train_slice)]
+    if finite_values.size == 0:
+        return 0.0, 1.0
+    mean = float(finite_values.mean())
+    std = float(finite_values.std())
+    if not np.isfinite(std) or std < MIN_STD:
+        std = 1.0
+    return mean, std
+
+
+def write_prepared_arrays(dense_bars, splits, validation_folds, output_dir):
     num_rows = len(dense_bars["close"])
     feature_path = os.path.join(output_dir, FEATURES_FILENAME)
     target_path = os.path.join(output_dir, TARGETS_FILENAME)
@@ -647,32 +662,49 @@ def write_prepared_arrays(dense_bars, splits, output_dir):
     target_memmap[:] = target
     target_memmap.flush()
 
-    scaler_row_start = max(
-        FEATURE_WARMUP_BARS - 1,
-        int(splits["train"]["sample_start"]) - LOOKBACK_BARS + 1,
+    train_scaler_row_start, train_scaler_row_stop = scaler_row_bounds(
+        splits["train"]["sample_start"], splits["train"]["sample_stop"]
     )
-    scaler_row_stop = splits["train"]["sample_stop"]
+    fold_scaler_bounds = [
+        scaler_row_bounds(fold["train_start"], fold["train_stop"]) for fold in validation_folds
+    ]
 
     feature_names = []
-    scaler = {}
+    train_scaler = {
+        "row_start": int(train_scaler_row_start),
+        "row_stop": int(train_scaler_row_stop),
+        "mean": [],
+        "std": [],
+    }
+    fold_scalers = [
+        {
+            "row_start": int(row_start),
+            "row_stop": int(row_stop),
+            "mean": [],
+            "std": [],
+        }
+        for row_start, row_stop in fold_scaler_bounds
+    ]
     features_memmap = np.lib.format.open_memmap(
         feature_path, mode="w+", dtype=np.float32, shape=(num_rows, len(FEATURE_NAMES))
     )
     for feature_idx, (name, values) in enumerate(generate_feature_columns(dense_bars)):
-        train_slice = np.asarray(values[scaler_row_start:scaler_row_stop], dtype=np.float64)
-        mean = float(np.nanmean(train_slice))
-        std = float(np.nanstd(train_slice))
-        if not np.isfinite(std) or std < MIN_STD:
-            std = 1.0
-        scaled = ((np.asarray(values, dtype=np.float64) - mean) / std).astype(np.float32, copy=False)
-        np.nan_to_num(scaled, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-        features_memmap[:, feature_idx] = scaled
+        raw_values = np.asarray(values, dtype=np.float32)
+        features_memmap[:, feature_idx] = raw_values
         feature_names.append(name)
-        scaler[name] = {"mean": mean, "std": std}
+        mean, std = compute_scaler(raw_values, train_scaler_row_start, train_scaler_row_stop)
+        train_scaler["mean"].append(mean)
+        train_scaler["std"].append(std)
+        for fold_scaler, (row_start, row_stop) in zip(fold_scalers, fold_scaler_bounds):
+            mean, std = compute_scaler(raw_values, row_start, row_stop)
+            fold_scaler["mean"].append(mean)
+            fold_scaler["std"].append(std)
     features_memmap.flush()
     if tuple(feature_names) != FEATURE_NAMES:
         raise ValueError("Feature generator order drifted from the benchmark feature list.")
-    return feature_names, scaler
+    for fold_info, fold_scaler in zip(validation_folds, fold_scalers):
+        fold_info["scaler"] = fold_scaler
+    return feature_names, train_scaler, validation_folds
 
 
 def save_metadata(output_dir, metadata):
@@ -712,7 +744,9 @@ def prepare_dataset(input_dir=DEFAULT_INPUT_DIR, output_dir=PREPARED_DIR):
     splits, validation_folds, min_sample_end, max_sample_end = build_splits(
         num_dense_rows, dense_bars["dense_start_time"]
     )
-    feature_names, scaler = write_prepared_arrays(dense_bars, splits, output_dir)
+    feature_names, train_scaler, validation_folds = write_prepared_arrays(
+        dense_bars, splits, validation_folds, output_dir
+    )
 
     abs_input_dir = os.path.abspath(input_dir)
 
@@ -721,8 +755,6 @@ def prepare_dataset(input_dir=DEFAULT_INPUT_DIR, output_dir=PREPARED_DIR):
         "source_kind": SOURCE_KIND,
         "input_dir": abs_input_dir,
         "prepared_dir": os.path.abspath(output_dir),
-        "time_budget": TIME_BUDGET,
-        "default_time_budget_seconds": TIME_BUDGET,
         "max_time_budget_seconds": MAX_TIME_BUDGET,
         "primary_metric": PRIMARY_METRIC,
         "primary_metric_direction": PRIMARY_METRIC_DIRECTION,
@@ -731,15 +763,15 @@ def prepare_dataset(input_dir=DEFAULT_INPUT_DIR, output_dir=PREPARED_DIR):
         "horizon_bars": HORIZON_BARS,
         "purge_bars": PURGE_BARS,
         "split_strategy": SPLIT_STRATEGY,
-        "train_window_ratio": TRAIN_WINDOW_RATIO,
         "val_ratio": VAL_RATIO,
         "test_ratio": TEST_RATIO,
         "num_val_folds": NUM_VAL_FOLDS,
+        "feature_scaling": "per_fold_standardize",
         "eval_samples": EVAL_SAMPLES,
         "feature_windows": list(FEATURE_WINDOWS),
         "feature_warmup_bars": FEATURE_WARMUP_BARS,
         "feature_names": feature_names,
-        "scaler": scaler,
+        "train_scaler": train_scaler,
         "dense_start_time": dense_bars["dense_start_time"],
         "dense_end_time": dense_bars["dense_end_time"],
         "num_raw_rows": dense_bars["num_raw_rows"],
@@ -788,10 +820,20 @@ def prepare_dataset(input_dir=DEFAULT_INPUT_DIR, output_dir=PREPARED_DIR):
 # Runtime helpers for train.py
 # ---------------------------------------------------------------------------
 
-def build_window_batch(dataset, endpoints, device):
+def scaler_arrays_from_info(scaler_info):
+    mean = np.asarray(scaler_info["mean"], dtype=np.float32)
+    std = np.asarray(scaler_info["std"], dtype=np.float32)
+    return mean, std
+
+
+def build_window_batch(dataset, endpoints, device, scaler_mean=None, scaler_std=None):
     row_idx = endpoints[:, None] - dataset.lookback_bars + 1 + dataset.window_offsets[None, :]
     x_np = np.asarray(dataset.features[row_idx], dtype=np.float32)
+    if scaler_mean is not None and scaler_std is not None:
+        x_np = (x_np - scaler_mean[None, None, :]) / scaler_std[None, None, :]
     y_np = np.asarray(dataset.targets[endpoints], dtype=np.float32)
+
+    np.nan_to_num(x_np, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
 
     x = torch.from_numpy(x_np)
     y = torch.from_numpy(y_np)
@@ -804,28 +846,84 @@ def build_window_batch(dataset, endpoints, device):
     return x, y
 
 
-def sample_batch(dataset, split, batch_size, device, rng):
-    start, stop = dataset.split_bounds(split)
+def sample_batch_range(dataset, sample_start, sample_stop, batch_size, device, rng, scaler_mean=None, scaler_std=None):
+    start = int(sample_start)
+    stop = int(sample_stop)
     endpoints = rng.integers(start, stop, size=batch_size, endpoint=False, dtype=np.int64)
-    return build_window_batch(dataset, endpoints, device)
+    return build_window_batch(
+        dataset,
+        endpoints,
+        device,
+        scaler_mean=scaler_mean,
+        scaler_std=scaler_std,
+    )
 
 
-def select_eval_endpoints(dataset, split, max_samples=None):
+def sample_batch(dataset, split, batch_size, device, rng, scaler_mean=None, scaler_std=None):
     start, stop = dataset.split_bounds(split)
+    return sample_batch_range(
+        dataset,
+        start,
+        stop,
+        batch_size,
+        device,
+        rng,
+        scaler_mean=scaler_mean,
+        scaler_std=scaler_std,
+    )
+
+
+def select_eval_endpoints_range(sample_start, sample_stop, max_samples=None):
+    start = int(sample_start)
+    stop = int(sample_stop)
     total = stop - start
     limit = total if max_samples is None else min(total, int(max_samples))
     if limit <= 0:
-        raise ValueError(f"Split {split} has no available samples.")
+        raise ValueError("Requested evaluation range has no available samples.")
     if limit == total:
         return np.arange(start, stop, dtype=np.int64)
     return np.linspace(start, stop - 1, num=limit, dtype=np.int64)
 
 
-def iter_eval_batches(dataset, split, batch_size, device, max_samples=None):
-    endpoints = select_eval_endpoints(dataset, split, max_samples=max_samples)
+def select_eval_endpoints(dataset, split, max_samples=None):
+    start, stop = dataset.split_bounds(split)
+    return select_eval_endpoints_range(start, stop, max_samples=max_samples)
+
+
+def iter_eval_batches_range(
+    dataset,
+    sample_start,
+    sample_stop,
+    batch_size,
+    device,
+    max_samples=None,
+    scaler_mean=None,
+    scaler_std=None,
+):
+    endpoints = select_eval_endpoints_range(sample_start, sample_stop, max_samples=max_samples)
     for start_idx in range(0, len(endpoints), batch_size):
         batch_endpoints = endpoints[start_idx : start_idx + batch_size]
-        yield build_window_batch(dataset, batch_endpoints, device)
+        yield build_window_batch(
+            dataset,
+            batch_endpoints,
+            device,
+            scaler_mean=scaler_mean,
+            scaler_std=scaler_std,
+        )
+
+
+def iter_eval_batches(dataset, split, batch_size, device, max_samples=None, scaler_mean=None, scaler_std=None):
+    start, stop = dataset.split_bounds(split)
+    yield from iter_eval_batches_range(
+        dataset,
+        start,
+        stop,
+        batch_size,
+        device,
+        max_samples=max_samples,
+        scaler_mean=scaler_mean,
+        scaler_std=scaler_std,
+    )
 
 
 def regression_metrics(predictions, targets):
@@ -846,17 +944,93 @@ def regression_metrics(predictions, targets):
 
 
 @torch.no_grad()
-def evaluate_regression(model, dataset, split, batch_size, device, autocast_ctx=None, max_samples=None):
+def predict_regression_range(
+    model,
+    dataset,
+    sample_start,
+    sample_stop,
+    batch_size,
+    device,
+    autocast_ctx=None,
+    max_samples=None,
+    scaler_mean=None,
+    scaler_std=None,
+):
     ctx = autocast_ctx if autocast_ctx is not None else nullcontext()
     pred_chunks = []
     target_chunks = []
-    for x, y in iter_eval_batches(dataset, split, batch_size, device, max_samples=max_samples):
+    for x, y in iter_eval_batches_range(
+        dataset,
+        sample_start,
+        sample_stop,
+        batch_size,
+        device,
+        max_samples=max_samples,
+        scaler_mean=scaler_mean,
+        scaler_std=scaler_std,
+    ):
         with ctx:
             preds = model(x)
         pred_chunks.append(preds.float().cpu())
         target_chunks.append(y.float().cpu())
     predictions = torch.cat(pred_chunks).numpy()
     targets = torch.cat(target_chunks).numpy()
+    return predictions, targets
+
+
+@torch.no_grad()
+def evaluate_regression_range(
+    model,
+    dataset,
+    sample_start,
+    sample_stop,
+    batch_size,
+    device,
+    autocast_ctx=None,
+    max_samples=None,
+    scaler_mean=None,
+    scaler_std=None,
+):
+    predictions, targets = predict_regression_range(
+        model,
+        dataset,
+        sample_start,
+        sample_stop,
+        batch_size,
+        device,
+        autocast_ctx=autocast_ctx,
+        max_samples=max_samples,
+        scaler_mean=scaler_mean,
+        scaler_std=scaler_std,
+    )
+    return regression_metrics(predictions, targets)
+
+
+@torch.no_grad()
+def evaluate_regression(
+    model,
+    dataset,
+    split,
+    batch_size,
+    device,
+    autocast_ctx=None,
+    max_samples=None,
+    scaler_mean=None,
+    scaler_std=None,
+):
+    sample_start, sample_stop = dataset.split_bounds(split)
+    predictions, targets = predict_regression_range(
+        model,
+        dataset,
+        sample_start,
+        sample_stop,
+        batch_size,
+        device,
+        autocast_ctx=autocast_ctx,
+        max_samples=max_samples,
+        scaler_mean=scaler_mean,
+        scaler_std=scaler_std,
+    )
     return regression_metrics(predictions, targets)
 
 
