@@ -1,5 +1,5 @@
 """
-Autoresearch time-series regression with a causal TCN.
+Autoresearch Orca minute-level regression with a causal TCN.
 
 Usage:
     uv run train.py
@@ -22,11 +22,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from prepare import (
-    DEFAULT_INPUT_CSV,
+    BAR_SECONDS,
+    DEFAULT_INPUT_DIR,
     EVAL_SAMPLES,
+    HORIZON_BARS,
+    LOOKBACK_BARS,
     MAX_TIME_BUDGET,
     PREPARED_DIR,
+    PREPARED_VERSION,
     PRIMARY_METRIC,
+    PURGE_BARS,
+    SPLIT_STRATEGY,
+    SOURCE_KIND,
     TIME_BUDGET,
     evaluate_regression,
     load_prepared_dataset,
@@ -303,13 +310,46 @@ def resolve_time_budget_seconds(requested_time_budget_seconds):
 
 
 def validate_prepared_input(dataset):
-    expected_input_csv = os.path.abspath(DEFAULT_INPUT_CSV)
-    actual_input_csv = os.path.abspath(dataset.metadata.get("input_csv", ""))
-    if actual_input_csv != expected_input_csv:
+    actual_version = dataset.metadata.get("version")
+    actual_source_kind = dataset.metadata.get("source_kind")
+    actual_input_dir = dataset.metadata.get("input_dir")
+    actual_bar_seconds = dataset.metadata.get("bar_seconds")
+    actual_lookback_bars = dataset.metadata.get("lookback_bars")
+    actual_horizon_bars = dataset.metadata.get("horizon_bars")
+    actual_purge_bars = dataset.metadata.get("purge_bars")
+    actual_split_strategy = dataset.metadata.get("split_strategy")
+
+    mismatches = []
+    if actual_version != PREPARED_VERSION:
+        mismatches.append(f"version expected {PREPARED_VERSION} but found {actual_version!r}")
+    if actual_source_kind != SOURCE_KIND:
+        mismatches.append(f"source_kind expected {SOURCE_KIND!r} but found {actual_source_kind!r}")
+
+    expected_input_dir = os.path.abspath(DEFAULT_INPUT_DIR)
+    normalized_actual_input_dir = None if not actual_input_dir else os.path.abspath(actual_input_dir)
+    if normalized_actual_input_dir != expected_input_dir:
+        mismatches.append(
+            f"input_dir expected {expected_input_dir!r} but found {normalized_actual_input_dir!r}"
+        )
+
+    if actual_bar_seconds != BAR_SECONDS:
+        mismatches.append(f"bar_seconds expected {BAR_SECONDS} but found {actual_bar_seconds!r}")
+    if actual_lookback_bars != LOOKBACK_BARS:
+        mismatches.append(f"lookback_bars expected {LOOKBACK_BARS} but found {actual_lookback_bars!r}")
+    if actual_horizon_bars != HORIZON_BARS:
+        mismatches.append(f"horizon_bars expected {HORIZON_BARS} but found {actual_horizon_bars!r}")
+    if actual_purge_bars != PURGE_BARS:
+        mismatches.append(f"purge_bars expected {PURGE_BARS} but found {actual_purge_bars!r}")
+    if actual_split_strategy != SPLIT_STRATEGY:
+        mismatches.append(
+            f"split_strategy expected {SPLIT_STRATEGY!r} but found {actual_split_strategy!r}"
+        )
+
+    if mismatches:
+        details = "\n".join(f"- {item}" for item in mismatches)
         raise RuntimeError(
-            "Prepared artifacts were built from a different CSV.\n"
-            f"Expected: {expected_input_csv}\n"
-            f"Found:    {actual_input_csv}\n"
+            "Prepared artifacts were built for a different data source or benchmark contract.\n"
+            f"{details}\n"
             "Run `uv run prepare.py` to rebuild the prepared dataset."
         )
 
@@ -408,7 +448,7 @@ def train_one_run(model, dataset, optimizer, train_config, device, time_budget_s
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train a causal TCN on prepared SOL time-series data.")
+    parser = argparse.ArgumentParser(description="Train a causal TCN on prepared Orca minute time-series data.")
     parser.add_argument(
         "--prepared-dir",
         type=str,

@@ -21,6 +21,8 @@ dev/
 findings/
 run.log
 gecko_pool_1s_history.csv
+orca_hist_last_year/
+.DS_Store
 
 # Results file
 results.tsv

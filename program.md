@@ -1,53 +1,229 @@
 # autoresearch
 
-This repo now runs autonomous **time-series forecasting** experiments on SOL OHLCV data.
+This repo runs autonomous **minute-level time-series forecasting** experiments on Orca Whirlpool data stored in `orca_hist_last_year/`.
 
 The job of the experiment agent is to improve the forecasting pipeline by iterating on:
 
 - the **model** in `train.py`
-- the **derived signals / feature engineering** in `prepare.py`
-
-The job of the human is to keep the **benchmark definition** stable so experiments remain comparable.
+- the **feature pipeline** in `prepare.py`
+- the **aggregations and derived signals** built from all Orca source files
+- the **lookback window** and related signal-side knobs in `prepare.py`
 
 ## Setup
 
 To set up a new experiment, work with the user to:
 
-1. **Agree on a run tag**: propose a tag based on today's date (for example `mar15`). The branch `autoresearch/<tag>` must not already exist.
+1. **Agree on a run tag**: propose a tag based on today's date, for example `mar17`. The branch `autoresearch/<tag>` must not already exist.
 2. **Create the branch**: create `autoresearch/<tag>` from the current default branch.
 3. **Read the in-scope files**:
-   - `README.md` for repository context.
+   - `README.md` for general repository context only.
    - `prepare.py` for the data contract, feature pipeline, split logic, and evaluation helpers.
    - `train.py` for the model, optimizer, and training loop.
    - `program.md` for the autonomous research rules.
-4. **Verify the raw dataset exists**: confirm `gecko_pool_1s_history.csv` is present in the repo root.
-5. **Verify prepared artifacts exist**: confirm `~/.cache/autoresearch/timeseries/` contains `features.npy`, `targets.npy`, and `metadata.json`, and if they were built from an older CSV, rerun `uv run prepare.py`.
-6. **Initialize local experiment artifacts**:
+4. **Treat the current Python code and this file as source of truth**:
+   - The README may lag behind the benchmark. If it disagrees with `prepare.py`, `train.py`, or `program.md`, follow the current code and this file.
+5. **Verify the raw dataset directory exists**:
+   - Confirm `orca_hist_last_year/` exists in the repo root.
+   - Confirm it contains:
+     - `metadata.json`
+     - `ohlcv_minutely.parquet`
+     - `swaps.parquet`
+     - `liquidity_events.parquet`
+     - `daily_state.parquet`
+6. **Verify prepared artifacts exist**:
+   - Confirm `~/.cache/autoresearch/timeseries/` contains `features.npy`, `targets.npy`, and `metadata.json`.
+   - If they were built from an older benchmark or a different input directory, rerun `uv run prepare.py`.
+7. **Initialize local experiment artifacts**:
    - Create `results.tsv` if it does not exist.
    - Ensure `findings/` exists locally.
    - Both `results.tsv` and `findings/` must remain untracked by git.
-7. **Confirm and go**: once setup looks correct, start the experiment loop.
+8. **Confirm and go**: once setup looks correct, start the experiment loop.
+
+## Orca Data Inventory
+
+The raw dataset is the entire `orca_hist_last_year/` directory. Use all of it when useful.
+
+### `metadata.json`
+
+This is the dataset manifest and provenance file.
+
+- It identifies the pool, token mints, fee rate, date range, row counts, and repair history.
+- It is useful for sanity checks, reporting, and benchmark provenance.
+- It is not the main predictive table, but it can inform constants and data validation.
+
+Important fields include:
+
+- `pool`
+- `token_mint_a`
+- `token_mint_b`
+- `fee_rate`
+- `date_start`
+- `date_end`
+- `daily_state_rows`
+- `swap_rows`
+- `liquidity_event_rows`
+- `ohlcv_minutely_rows`
+- `repair_history`
+
+### `ohlcv_minutely.parquet`
+
+This is the canonical **1-minute OHLCV bar table** and the base time grid for the benchmark.
+
+Columns:
+
+- `timestamp`
+- `open`
+- `high`
+- `low`
+- `close`
+- `volume`
+
+How to use it:
+
+- Sort by `timestamp` and deduplicate deterministically.
+- Reindex to a complete 1-minute grid across the covered range.
+- Use it as the price target source and as the base timeline for all joins.
+- Derive baseline price, candle, return, volume, momentum, mean-reversion, volatility, and missingness features from it.
+
+Important caveats:
+
+- Missing minutes exist and must be handled explicitly.
+- Under this benchmark, a missing minute should be interpreted as a **no-trade minute** for the pool.
+- Treat no-trade minutes as signal, not as noise to be ignored away.
+- Preserve explicit missingness / no-trade indicators so the model can learn from market inactivity.
+
+### `swaps.parquet`
+
+This is the raw event-level swap tape for the same pool.
+
+Columns:
+
+- `slot`
+- `block_time`
+- `instruction`
+- `amount_in`
+- `amount_out`
+- `sqrt_price_pre`
+- `sqrt_price_post`
+- `tick_current_index_pre`
+- `tick_current_index_post`
+- `liquidity_pre`
+- `liquidity_post`
+- `fee_rate`
+
+How to use it:
+
+- Aggregate it onto the canonical minute grid.
+- Build robust swap-flow features such as:
+  - trade count
+  - summed and averaged swap sizes
+  - max swap size
+  - tick-move summaries
+  - event-intensity proxies
+
+Important caveats:
+
+- Several numeric fields are raw on-chain values.
+- These values may be large and may need `log1p`, normalization, or careful aggregation.
+- Do not use future information when aggregating.
+
+### `liquidity_events.parquet`
+
+This is the raw event-level LP and liquidity-management table.
+
+Columns:
+
+- `slot`
+- `block_time`
+- `instruction`
+- `tick_lower_index`
+- `tick_upper_index`
+- `liquidity_delta`
+- `sqrt_price_pre`
+- `sqrt_price_post`
+- `tick_current_index_pre`
+- `tick_current_index_post`
+- `liquidity_pre`
+- `liquidity_post`
+- `fee_rate`
+
+How to use it:
+
+- Aggregate it onto the canonical minute grid.
+- Build robust liquidity-regime features such as:
+  - counts by instruction
+  - net liquidity change
+  - absolute liquidity churn
+  - average LP range width
+  - position open/close activity
+
+Important caveats:
+
+- Some instruction types naturally have nulls in some fields.
+- Handle nulls in an instruction-aware way.
+- Favor stable simple aggregates over brittle event-order assumptions.
+
+### `daily_state.parquet`
+
+This is the slow-moving daily pool-state snapshot table.
+
+Columns:
+
+- `date`
+- `tick_spacing`
+- `fee_rate`
+- `sqrt_price`
+- `tick_current_index`
+- `liquidity`
+
+How to use it:
+
+- Join it as a slower daily overlay on the minute grid.
+- Forward-fill daily state within each day as needed.
+- Derive slow regime features such as:
+  - daily liquidity level
+  - daily tick regime
+  - daily state changes
+
+Important caveats:
+
+- These are not minute bars.
+- Use them as regime context, not as a replacement for the minute grid.
+
+### General Data Notes
+
+- `ohlcv_minutely.parquet` is the benchmark anchor.
+- `swaps.parquet` and `liquidity_events.parquet` are auxiliary event streams that must be aggregated onto the minute grid.
+- `daily_state.parquet` is a slower regime overlay.
+- Raw on-chain numeric fields can be large; robust transforms are encouraged.
+- Sort or group data deterministically before any lagged, rolling, or aggregation logic.
 
 ## Benchmark Contract
 
 These rules are fixed unless a human explicitly changes them:
 
-- The raw dataset is `gecko_pool_1s_history.csv`.
-- Missing seconds are **densified** into synthetic 1-second bars.
-- Synthetic bars must use:
+- The raw dataset is the directory `orca_hist_last_year/`.
+- The canonical bar grid is **1-minute bars** anchored on `ohlcv_minutely.parquet`.
+- Missing minutes are **densified** into synthetic 1-minute bars.
+- For benchmark purposes, a missing minute means there were **no trades in that minute**.
+- Synthetic minute bars must use:
   - `open = previous_close`
   - `high = previous_close`
   - `low = previous_close`
   - `close = previous_close`
   - `volume = 0`
+- Keep an explicit missingness indicator for synthetic minutes.
+- Treat synthetic / no-trade minutes as predictive state and preserve that information in the feature set.
+- Auxiliary features may be derived from `swaps.parquet`, `liquidity_events.parquet`, `daily_state.parquet`, and `metadata.json`, but they must align causally to the minute grid.
 - The prediction target is:
-  - `log(close[t+60] / close[t])`
+  - `log(close[t+3] / close[t])`
 - Splits are chronological.
+- Training uses a fixed-width rolling window of recent history rather than the full past.
 - Purge gaps remain part of the split contract.
 - The newest block remains the untouched final test set.
 - The primary keep/discard metric is **`val_corr`**.
-- The default wall-clock training budget is **20 minutes**.
-- The agent may rerun a promising candidate for up to **45 minutes** by explicitly setting a longer time budget, but should do this sparingly.
+- A good default wall-clock training budget is **600 seconds**, but the agent may choose the training budget for any experiment when justified.
+- In general, prefer shorter runs for faster iteration loops, but run long enough to get reliable results and useful insight.
 - Do not add dependencies or change repo-wide instructions without human approval.
 
 Do not change the benchmark to make numbers look better. Improve the forecaster, not the game.
@@ -56,28 +232,43 @@ Do not change the benchmark to make numbers look better. Improve the forecaster,
 
 - `train.py`
   - Model family and architecture.
-  - Learned feature extraction / representation learning inside the model from the allowed input window.
-  - Hidden size, layer count, dropout, regularization.
+  - Hidden size, layer count, dropout, regularization, sequence summarization, and overall model size / parameter count.
+  - Experiments with materially different architectures, representation styles, depths, widths, and capacities.
   - Optimizer, LR schedule, batch sizing, and training loop details.
   - Loss implementation and diagnostics.
 - `prepare.py`
-  - Derived signals from the raw OHLCV bars.
-  - Feature transforms and rolling statistics.
-  - Normalization method, as long as it is fit on train-only data.
-  - Input lookback length and other signal-side knobs.
+  - Minute-grid feature engineering from `ohlcv_minutely.parquet`.
+  - Aggregations derived from `swaps.parquet`.
+  - Aggregations derived from `liquidity_events.parquet`.
+  - Regime overlays derived from `daily_state.parquet`.
+  - Any robust use of `metadata.json` for validation or constant side information.
+  - Rolling statistics, transforms, and normalization, as long as normalization is fit on train-only data.
+  - `LOOKBACK_BARS`, feature windows, and other signal-side knobs.
+  - Feature engineering as a first-class research lever, not just minor cleanup around the model.
 
-If you modify feature engineering or sequence construction in `prepare.py`, rerun `uv run prepare.py` before the next training run.
+Explicit instruction:
+
+- Your job is **not only** to tune architecture and optimization.
+- You are explicitly allowed to edit **both** `train.py` and `prepare.py`.
+- The human expects you to treat **model engineering and feature engineering as equally important levers** for improving `val_corr`.
+- Your job **also explicitly includes feature engineering from all Orca source files** when doing so may improve `val_corr`.
+- Do not limit yourself to minor hyperparameter tweaks. Actively experiment with different model architectures, different model sizes, and different parameter budgets when justified.
+- You are **free to modify the lookback** and related signal-side settings when justified.
+- You should treat missing / synthetic minutes as meaningful **no-trade state** and engineer features that let the model use that information.
+
+If you modify feature engineering, aggregation logic, normalization, missingness handling, or sequence construction in `prepare.py`, rerun `uv run prepare.py` before the next training run.
 
 Clarification:
 
-- If you change the prepared input columns, rolling computations, normalization, or sequence-construction contract, do it in `prepare.py`.
+- If you change prepared input columns, rolling computations, event aggregation logic, normalization, or lookback, do it in `prepare.py`.
 - If the model in `train.py` learns its own transformations of the existing input window, that is allowed.
 - Learned feature extraction must not use future information, alter the benchmark contract, or introduce train/val/test leakage.
 
 ## What You May Not Modify
 
-- The raw dataset path or data source.
-- The gap-fill semantics for missing seconds.
+- The raw dataset directory or file set.
+- The canonical minute-grid anchoring on `ohlcv_minutely.parquet`.
+- The missing-minute fill semantics.
 - The target definition.
 - The chronological split semantics.
 - The purge-gap logic as part of the benchmark contract.
@@ -93,15 +284,15 @@ Secondary metrics such as `val_rmse`, `val_mae`, and `val_sign_acc` are for diag
 
 Unless there is a clear reason to do otherwise:
 
-- Use the default `20 minute` budget for ordinary exploration runs.
-- Optionally rerun a promising candidate at `30-45 minutes` for confirmation.
-- Do not compare a `20 minute` run directly against a `45 minute` run without noting the different budget in the findings and `results.tsv`.
+- Start with shorter runs so you can complete more iteration loops.
+- Increase the training budget when a stronger signal, a fairer confirmation, or better insight is worth the extra time.
+- When comparing runs, note the configured budget in the findings and `results.tsv` and avoid pretending that short and long runs are directly equivalent.
 
 **Simplicity criterion**: all else equal, simpler is better. A tiny improvement that adds brittle complexity is usually not worth keeping. A similarly good or better result with simpler code is a win.
 
 **The first run** should establish the baseline with the current code:
 
-1. Run `uv run prepare.py` if needed.
+1. Run `uv run prepare.py`.
 2. Run `uv run train.py` exactly as-is.
 3. Record the baseline before trying ideas.
 
@@ -120,30 +311,30 @@ val_sign_acc:      0.531250
 last_train_loss:   0.000456
 smooth_train_loss: 0.000512
 last_grad_norm:    3.142857
- time_budget_s:     1200
- max_time_budget_s: 2700
-startup_seconds:   1.8
- training_seconds:  1200.0
-eval_seconds:      18.4
-total_seconds:     1220.2
+time_budget_s:     600
+max_time_budget_s: 1200
+startup_seconds:   2.1
+training_seconds:  600.0
+eval_seconds:      8.4
+total_seconds:     610.8
 avg_samples_sec:   3820.5
 peak_vram_mb:      1420.7
 total_windows_K:   1228.8
- num_steps:         1200
-grad_accum_steps:  8
-device_batch_size: 256
+num_steps:         1200
+grad_accum_steps:  4
+device_batch_size: 512
 total_batch_size:  2048
 num_params_M:      0.185
 device:            cuda
-feature_dim:       17
-train_samples:     3561212
-val_samples:       763271
-test_samples:      763271
-eval_samples:      131072
-observed_bars:     5055033
-synthetic_bars:    34099
+feature_dim:       42
+train_samples:     366000
+val_samples:       78300
+test_samples:      78300
+eval_samples:      78300
+observed_bars:     520138
+synthetic_bars:    5462
 lookback_bars:     300
-horizon_bars:      60
+horizon_bars:      3
 ```
 
 Extract the key metrics from `run.log` after each run. Higher `val_corr` is better.
@@ -161,7 +352,7 @@ commit	time_budget_s	training_seconds	val_corr	val_rmse	val_mae	val_sign_acc	mem
 Columns:
 
 1. Short git commit hash.
-2. Configured time budget in seconds, such as `1200` or `2700`.
+2. Configured time budget in seconds, such as `600` or `1200`.
 3. Actual `training_seconds` achieved. Use `0.0` for crashes.
 4. `val_corr` achieved. Higher is better. Use `nan` for crashes.
 5. `val_rmse` achieved. Use `nan` for crashes.
@@ -171,16 +362,6 @@ Columns:
 9. Status: `keep`, `discard`, or `crash`.
 10. Short description of the experiment.
 11. Relative path to the markdown report in `findings/`.
-
-Example:
-
-```text
-commit	time_budget_s	training_seconds	val_corr	val_rmse	val_mae	val_sign_acc	memory_gb	status	description	findings_file
-a1b2c3d	1200	1200.1	0.012300	0.012345	0.009876	0.5312	1.4	keep	baseline lstm findings/2026-03-15-baseline.md
-b2c3d4e	1200	1200.0	0.018900	0.011980	0.009410	0.5386	1.5	keep	add realized vol features findings/2026-03-15-realized-vol.md
-c3d4e5f	2700	2700.2	0.021400	0.011500	0.009100	0.5410	1.5	keep	confirm promising realized vol run findings/2026-03-15-confirm-realized-vol.md
-d4e5f6g	1200	0.0	nan	nan	nan	nan	0.0	crash	bad feature normalization findings/2026-03-15-crash-normalization.md
-```
 
 ## Findings Reports
 
@@ -221,23 +402,29 @@ Findings must remain local untracked artifacts so they survive discarded code re
 
 ## The Experiment Loop
 
-The experiment runs on a dedicated branch such as `autoresearch/mar15`.
+The experiment runs on a dedicated branch such as `autoresearch/mar17`.
 
 LOOP FOREVER:
 
 1. Check the current branch and commit.
 2. Decide whether the next idea is:
    - model-focused
-   - signal-focused
-   - a combined model + signal change
+   - feature-focused
+   - a combined model + feature change
 3. Edit `train.py` and, when justified, the signal-engineering parts of `prepare.py`.
-4. If `prepare.py` changed in a way that affects prepared data, rerun:
+4. In `prepare.py`, consider all available raw sources:
+   - `ohlcv_minutely.parquet`
+   - `swaps.parquet`
+   - `liquidity_events.parquet`
+   - `daily_state.parquet`
+   - `metadata.json`
+5. If `prepare.py` changed in a way that affects prepared data, rerun:
    - `uv run prepare.py`
-5. Commit the tracked code changes.
-6. Run the experiment:
+6. Commit the tracked code changes.
+7. Run the experiment:
    - Default screen: `uv run train.py > run.log 2>&1`
-   - Optional confirmation rerun: `uv run train.py --time-budget-seconds 2700 > run.log 2>&1`
-7. Read out the results from `run.log`:
+   - Custom budget run: `uv run train.py --time-budget-seconds <seconds> > run.log 2>&1`
+8. Read out the results from `run.log`:
    - `time_budget_s`
    - `training_seconds`
    - `val_corr`
@@ -245,25 +432,21 @@ LOOP FOREVER:
    - `val_mae`
    - `val_sign_acc`
    - `peak_vram_mb`
-8. If the metrics are missing, treat the run as a crash and inspect the traceback.
-9. Write the detailed markdown report to `findings/`.
-10. Append the structured result to `results.tsv`.
-11. Compare runs fairly at the same budget whenever possible.
-12. If a `20 minute` run is promising, you may rerun it at up to `45 minutes` to confirm the signal before deciding whether to keep it.
-13. If `val_corr` improved on a fair comparison, keep the change.
-14. If `val_corr` is worse or equal, restore the tracked code to the last kept commit, but keep the local findings and result logs.
-
-## Crash Handling
-
-If a run crashes:
-
-- If the issue is trivial and clearly fixable, fix it and rerun.
-- If the idea itself is broken, log it as `crash`, write the findings report, and move on.
+9. If the metrics are missing, treat the run as a crash and inspect the traceback.
+10. Write the detailed markdown report to `findings/`.
+11. Append the structured result to `results.tsv`.
+12. Compare runs fairly at the same budget whenever possible.
+13. If a shorter run is promising, you may rerun it at a longer budget to confirm the signal before deciding whether to keep it.
+14. If `val_corr` improved on a fair comparison, keep the change.
+15. If `val_corr` is worse or equal, restore the tracked code to the last kept commit, but keep the local findings and result logs.
 
 ## Timeout
 
-Each experiment should take about 20 minutes of training time by default, or up to 45 minutes for an explicit confirmation rerun, plus startup and evaluation overhead. If a run goes meaningfully beyond its configured budget and is clearly hung, stop it, log the failure, and move on.
+The agent may choose the training budget for any experiment. In general, prefer shorter runs so you can complete more iteration loops and improve the model faster, but make sure each run is long enough to produce good results and useful insight. Use `--time-budget-seconds <seconds>` whenever a custom duration is warranted. If a run goes meaningfully beyond its configured budget and is clearly hung, stop it, log the failure, and move on.
 
-## Never Stop
+Crashes: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
 
-Once the experiment loop begins, do not pause to ask the human if you should continue. Keep iterating until explicitly interrupted.
+NEVER STOP: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working indefinitely until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read papers referenced in the code, re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period.
+
+As an example use case, a user might leave you running while they sleep. The user then wakes up to experimental results, all completed by you while they slept!
+

@@ -1,9 +1,9 @@
 """
-One-time data preparation for autoresearch time-series experiments.
+One-time data preparation for autoresearch Orca minute-level experiments.
 
 Usage:
     uv run prepare.py
-    uv run prepare.py --input-csv /path/to/sol.csv
+    uv run prepare.py --input-dir /path/to/orca_hist_last_year
 
 Prepared artifacts are stored under ~/.cache/autoresearch/timeseries by default.
 """
@@ -19,39 +19,72 @@ from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.parquet as pq
 import torch
 
 # ---------------------------------------------------------------------------
 # Fixed benchmark contract (only change with explicit human approval)
 # ---------------------------------------------------------------------------
 
+PREPARED_VERSION = 3
 TIME_BUDGET = 600
 MAX_TIME_BUDGET = 1_200
-HORIZON_BARS = 60
+BAR_SECONDS = 60
+HORIZON_BARS = 3
 VAL_RATIO = 0.15
 TEST_RATIO = 0.15
+TRAIN_WINDOW_RATIO = 0.50
 NUM_VAL_FOLDS = 3
 EVAL_SAMPLES = 131_072
 PRIMARY_METRIC = "val_corr"
 PRIMARY_METRIC_DIRECTION = "higher_is_better"
+SOURCE_KIND = "orca_parquet_dir"
+SPLIT_STRATEGY = "rolling_window"
 FEATURE_NAMES = (
     "log_close",
     "log_volume",
     "log_return_1",
-    "log_return_5",
+    "log_return_3",
     "log_return_15",
     "log_return_60",
     "body_frac",
     "range_frac",
     "upper_wick_frac",
     "lower_wick_frac",
+    "close_vs_sma_15",
     "close_vs_sma_60",
     "close_vs_sma_300",
+    "volume_zscore_15",
     "volume_zscore_60",
+    "realized_vol_15",
     "realized_vol_60",
-    "realized_vol_300",
-    "log_seconds_since_trade",
+    "log_minutes_since_observed",
     "is_synthetic_bar",
+    "log_swap_count",
+    "log_swap_amount_in_sum",
+    "log_swap_amount_out_sum",
+    "log_swap_amount_in_mean",
+    "log_swap_amount_out_mean",
+    "log_swap_amount_in_max",
+    "log_swap_amount_out_max",
+    "swap_tick_delta_sum",
+    "swap_tick_delta_abs_sum",
+    "swap_tick_delta_max_abs",
+    "log_liq_event_count",
+    "log_liq_delta_abs_sum",
+    "liq_delta_net",
+    "log_liq_increase_count",
+    "log_liq_decrease_count",
+    "log_liq_open_count",
+    "log_liq_close_count",
+    "log_liq_reset_range_count",
+    "liq_range_width_mean",
+    "daily_tick_current_index",
+    "daily_log_liquidity",
+    "daily_tick_change_1d",
+    "daily_log_liquidity_change_1d",
 )
 
 # ---------------------------------------------------------------------------
@@ -59,7 +92,7 @@ FEATURE_NAMES = (
 # ---------------------------------------------------------------------------
 
 LOOKBACK_BARS = 300
-FEATURE_WINDOWS = (10, 60, 300)
+FEATURE_WINDOWS = (15, 60, 300)
 
 # Derived from the benchmark contract plus the current signal settings.
 FEATURE_WARMUP_BARS = max(FEATURE_WINDOWS)
@@ -70,7 +103,7 @@ PURGE_BARS = LOOKBACK_BARS + HORIZON_BARS
 # ---------------------------------------------------------------------------
 
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_INPUT_CSV = os.path.join(REPO_DIR, "gecko_pool_1s_history.csv")
+DEFAULT_INPUT_DIR = os.path.join(REPO_DIR, "orca_hist_last_year")
 CACHE_DIR = os.environ.get(
     "AUTORESEARCH_CACHE_DIR",
     os.path.join(os.path.expanduser("~"), ".cache", "autoresearch"),
@@ -82,6 +115,10 @@ PREPARED_DIR = os.environ.get(
 FEATURES_FILENAME = "features.npy"
 TARGETS_FILENAME = "targets.npy"
 METADATA_FILENAME = "metadata.json"
+OHLCV_FILENAME = "ohlcv_minutely.parquet"
+SWAPS_FILENAME = "swaps.parquet"
+LIQUIDITY_EVENTS_FILENAME = "liquidity_events.parquet"
+DAILY_STATE_FILENAME = "daily_state.parquet"
 MIN_STD = 1e-6
 EPS = 1e-12
 
@@ -170,7 +207,7 @@ def safe_zscore(values, mean_values, std_values):
 
 
 def dense_row_to_timestamp(metadata, row_idx):
-    return int(metadata["dense_start_time"]) + int(row_idx)
+    return int(metadata["dense_start_time"]) + int(row_idx) * int(metadata.get("bar_seconds", BAR_SECONDS))
 
 
 def summarize_split(name, split_info):
@@ -184,69 +221,267 @@ def summarize_split(name, split_info):
 # Data preparation
 # ---------------------------------------------------------------------------
 
-def load_raw_bars(input_csv):
-    usecols = ["time", "open", "high", "low", "close", "volume"]
-    dtypes = {
-        "time": "int64",
-        "open": "float32",
-        "high": "float32",
-        "low": "float32",
-        "close": "float32",
-        "volume": "float32",
-    }
-    df = pd.read_csv(input_csv, usecols=usecols, dtype=dtypes)
+def arrow_array_to_numpy(array, dtype):
+    values = array.to_numpy(zero_copy_only=False)
+    return np.asarray(values, dtype=dtype)
+
+
+def arrow_decimal_to_float64(array):
+    values = pc.cast(array, pa.float64(), safe=False).to_numpy(zero_copy_only=False)
+    return np.asarray(values, dtype=np.float64)
+
+
+def validate_input_dir(input_dir):
+    if not os.path.isdir(input_dir):
+        raise FileNotFoundError(f"Input directory not found: {input_dir}")
+    required_files = (
+        METADATA_FILENAME,
+        OHLCV_FILENAME,
+        SWAPS_FILENAME,
+        LIQUIDITY_EVENTS_FILENAME,
+        DAILY_STATE_FILENAME,
+    )
+    for filename in required_files:
+        path = os.path.join(input_dir, filename)
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Missing required input file: {path}")
+
+
+def load_source_manifest(input_dir):
+    manifest_path = os.path.join(input_dir, METADATA_FILENAME)
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def compute_steps_since_observed(observed):
+    observed = np.asarray(observed, dtype=bool)
+    if observed.size == 0:
+        return np.zeros(0, dtype=np.float32)
+    row_idx = np.arange(observed.size, dtype=np.int64)
+    last_observed = np.maximum.accumulate(np.where(observed, row_idx, 0))
+    return (row_idx - last_observed).astype(np.float32, copy=False)
+
+
+def load_ohlcv_minutely_bars(input_dir):
+    path = os.path.join(input_dir, OHLCV_FILENAME)
+    usecols = ["timestamp", "open", "high", "low", "close", "volume"]
+    df = pd.read_parquet(path, columns=usecols)
     if df.empty:
-        raise ValueError(f"No rows found in {input_csv}")
-    df = df.sort_values("time").drop_duplicates("time", keep="last").reset_index(drop=True)
-    times = df["time"].to_numpy(dtype=np.int64, copy=True)
-    if np.any(np.diff(times) <= 0):
-        raise ValueError("Expected strictly increasing timestamps after dedupe.")
-    bars = {
-        "open": df["open"].to_numpy(dtype=np.float32, copy=True),
-        "high": df["high"].to_numpy(dtype=np.float32, copy=True),
-        "low": df["low"].to_numpy(dtype=np.float32, copy=True),
-        "close": df["close"].to_numpy(dtype=np.float32, copy=True),
-        "volume": df["volume"].to_numpy(dtype=np.float32, copy=True),
-    }
-    return times, bars
+        raise ValueError(f"No rows found in {path}")
 
+    for col in usecols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["timestamp"] = df["timestamp"].astype(np.int64, copy=False)
+    df = df.sort_values("timestamp").drop_duplicates("timestamp", keep="last").reset_index(drop=True)
 
-def densify_bars(times, raw_bars):
-    segment_lengths = np.diff(np.append(times, times[-1] + 1)).astype(np.int64, copy=False)
-    dense_length = int(segment_lengths.sum())
-    dense_close = np.repeat(raw_bars["close"], segment_lengths).astype(np.float32, copy=False)
-    dense_open = dense_close.copy()
-    dense_high = dense_close.copy()
-    dense_low = dense_close.copy()
-    dense_volume = np.zeros(dense_length, dtype=np.float32)
-    observed = np.zeros(dense_length, dtype=np.float32)
+    timestamps = df["timestamp"].to_numpy(dtype=np.int64, copy=True)
+    if np.any(np.diff(timestamps) <= 0):
+        raise ValueError("Expected strictly increasing minute timestamps after dedupe.")
+    if np.any(timestamps % BAR_SECONDS != 0):
+        raise ValueError("Expected minute timestamps aligned to 60-second boundaries.")
 
-    start_rows = np.empty(times.shape[0], dtype=np.int32)
-    start_rows[0] = 0
-    if len(times) > 1:
-        np.cumsum(segment_lengths[:-1], out=start_rows[1:])
+    full_index = pd.Index(
+        np.arange(timestamps[0], timestamps[-1] + BAR_SECONDS, BAR_SECONDS, dtype=np.int64),
+        name="timestamp",
+    )
+    minute_frame = df.set_index("timestamp").reindex(full_index)
+    observed = minute_frame["close"].notna().to_numpy(dtype=np.float32, copy=False)
 
-    dense_open[start_rows] = raw_bars["open"]
-    dense_high[start_rows] = raw_bars["high"]
-    dense_low[start_rows] = raw_bars["low"]
-    dense_volume[start_rows] = raw_bars["volume"]
-    observed[start_rows] = 1.0
-
-    dense_rows = np.arange(dense_length, dtype=np.int32)
-    seconds_since_trade = dense_rows - np.repeat(start_rows, segment_lengths)
+    close = pd.to_numeric(minute_frame["close"], errors="coerce").ffill().bfill()
+    open_ = pd.to_numeric(minute_frame["open"], errors="coerce").fillna(close)
+    high = pd.to_numeric(minute_frame["high"], errors="coerce").fillna(close)
+    low = pd.to_numeric(minute_frame["low"], errors="coerce").fillna(close)
+    volume = pd.to_numeric(minute_frame["volume"], errors="coerce").fillna(0.0).clip(lower=0.0)
 
     return {
-        "open": dense_open,
-        "high": dense_high,
-        "low": dense_low,
-        "close": dense_close,
-        "volume": dense_volume,
+        "open": open_.to_numpy(dtype=np.float32, copy=True),
+        "high": high.to_numpy(dtype=np.float32, copy=True),
+        "low": low.to_numpy(dtype=np.float32, copy=True),
+        "close": close.to_numpy(dtype=np.float32, copy=True),
+        "volume": volume.to_numpy(dtype=np.float32, copy=True),
         "observed": observed,
-        "seconds_since_trade": seconds_since_trade.astype(np.float32, copy=False),
-        "dense_start_time": int(times[0]),
-        "dense_end_time": int(times[-1]),
-        "num_raw_rows": int(len(times)),
+        "minutes_since_observed": compute_steps_since_observed(observed),
+        "dense_start_time": int(full_index[0]),
+        "dense_end_time": int(full_index[-1]),
+        "num_raw_rows": int(len(df)),
     }
+
+
+def aggregate_swaps(input_dir, dense_start_time, num_rows):
+    path = os.path.join(input_dir, SWAPS_FILENAME)
+    parquet_file = pq.ParquetFile(path)
+    columns = [
+        "block_time",
+        "amount_in",
+        "amount_out",
+        "tick_current_index_pre",
+        "tick_current_index_post",
+    ]
+    col_idx = {name: idx for idx, name in enumerate(columns)}
+
+    swap_count = np.zeros(num_rows, dtype=np.float64)
+    amount_in_sum = np.zeros(num_rows, dtype=np.float64)
+    amount_out_sum = np.zeros(num_rows, dtype=np.float64)
+    amount_in_max = np.zeros(num_rows, dtype=np.float64)
+    amount_out_max = np.zeros(num_rows, dtype=np.float64)
+    tick_delta_sum = np.zeros(num_rows, dtype=np.float64)
+    tick_delta_abs_sum = np.zeros(num_rows, dtype=np.float64)
+    tick_delta_abs_max = np.zeros(num_rows, dtype=np.float64)
+    total_rows = 0
+
+    for batch in parquet_file.iter_batches(batch_size=1_000_000, columns=columns):
+        total_rows += batch.num_rows
+        block_time = arrow_array_to_numpy(batch.column(col_idx["block_time"]), np.int64)
+        row_idx = ((block_time - dense_start_time) // BAR_SECONDS).astype(np.int64, copy=False)
+        valid = (row_idx >= 0) & (row_idx < num_rows)
+        if not np.any(valid):
+            continue
+
+        row_idx = row_idx[valid]
+        amount_in = np.nan_to_num(
+            arrow_decimal_to_float64(batch.column(col_idx["amount_in"]))[valid],
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        amount_out = np.nan_to_num(
+            arrow_decimal_to_float64(batch.column(col_idx["amount_out"]))[valid],
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        tick_pre = arrow_array_to_numpy(batch.column(col_idx["tick_current_index_pre"]), np.float64)[valid]
+        tick_post = arrow_array_to_numpy(batch.column(col_idx["tick_current_index_post"]), np.float64)[valid]
+        tick_delta = np.nan_to_num(tick_post - tick_pre, nan=0.0, posinf=0.0, neginf=0.0)
+        tick_delta_abs = np.abs(tick_delta)
+
+        swap_count += np.bincount(row_idx, minlength=num_rows)
+        amount_in_sum += np.bincount(row_idx, weights=amount_in, minlength=num_rows)
+        amount_out_sum += np.bincount(row_idx, weights=amount_out, minlength=num_rows)
+        tick_delta_sum += np.bincount(row_idx, weights=tick_delta, minlength=num_rows)
+        tick_delta_abs_sum += np.bincount(row_idx, weights=tick_delta_abs, minlength=num_rows)
+        np.maximum.at(amount_in_max, row_idx, amount_in)
+        np.maximum.at(amount_out_max, row_idx, amount_out)
+        np.maximum.at(tick_delta_abs_max, row_idx, tick_delta_abs)
+
+    count_denom = np.maximum(swap_count, 1.0)
+    return {
+        "swap_count": swap_count.astype(np.float32, copy=False),
+        "swap_amount_in_sum": amount_in_sum.astype(np.float32, copy=False),
+        "swap_amount_out_sum": amount_out_sum.astype(np.float32, copy=False),
+        "swap_amount_in_mean": (amount_in_sum / count_denom).astype(np.float32, copy=False),
+        "swap_amount_out_mean": (amount_out_sum / count_denom).astype(np.float32, copy=False),
+        "swap_amount_in_max": amount_in_max.astype(np.float32, copy=False),
+        "swap_amount_out_max": amount_out_max.astype(np.float32, copy=False),
+        "swap_tick_delta_sum": tick_delta_sum.astype(np.float32, copy=False),
+        "swap_tick_delta_abs_sum": tick_delta_abs_sum.astype(np.float32, copy=False),
+        "swap_tick_delta_max_abs": tick_delta_abs_max.astype(np.float32, copy=False),
+    }, int(total_rows)
+
+
+def aggregate_liquidity_events(input_dir, dense_start_time, num_rows):
+    path = os.path.join(input_dir, LIQUIDITY_EVENTS_FILENAME)
+    parquet_file = pq.ParquetFile(path)
+    columns = [
+        "block_time",
+        "instruction",
+        "tick_lower_index",
+        "tick_upper_index",
+        "liquidity_delta",
+    ]
+    col_idx = {name: idx for idx, name in enumerate(columns)}
+
+    liq_event_count = np.zeros(num_rows, dtype=np.float64)
+    liq_delta_net = np.zeros(num_rows, dtype=np.float64)
+    liq_delta_abs_sum = np.zeros(num_rows, dtype=np.float64)
+    liq_range_width_sum = np.zeros(num_rows, dtype=np.float64)
+    liq_increase_count = np.zeros(num_rows, dtype=np.float64)
+    liq_decrease_count = np.zeros(num_rows, dtype=np.float64)
+    liq_open_count = np.zeros(num_rows, dtype=np.float64)
+    liq_close_count = np.zeros(num_rows, dtype=np.float64)
+    liq_reset_range_count = np.zeros(num_rows, dtype=np.float64)
+    total_rows = 0
+
+    for batch in parquet_file.iter_batches(batch_size=1_000_000, columns=columns):
+        total_rows += batch.num_rows
+        block_time = arrow_array_to_numpy(batch.column(col_idx["block_time"]), np.int64)
+        row_idx = ((block_time - dense_start_time) // BAR_SECONDS).astype(np.int64, copy=False)
+        valid = (row_idx >= 0) & (row_idx < num_rows)
+        if not np.any(valid):
+            continue
+
+        row_idx = row_idx[valid]
+        instructions = batch.column(col_idx["instruction"]).to_numpy(zero_copy_only=False)[valid]
+        tick_lower = arrow_array_to_numpy(batch.column(col_idx["tick_lower_index"]), np.float64)[valid]
+        tick_upper = arrow_array_to_numpy(batch.column(col_idx["tick_upper_index"]), np.float64)[valid]
+        range_width = np.nan_to_num(tick_upper - tick_lower, nan=0.0, posinf=0.0, neginf=0.0)
+        liq_delta = np.nan_to_num(
+            arrow_decimal_to_float64(batch.column(col_idx["liquidity_delta"]))[valid],
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+
+        liq_event_count += np.bincount(row_idx, minlength=num_rows)
+        liq_delta_net += np.bincount(row_idx, weights=liq_delta, minlength=num_rows)
+        liq_delta_abs_sum += np.bincount(row_idx, weights=np.abs(liq_delta), minlength=num_rows)
+        liq_range_width_sum += np.bincount(row_idx, weights=range_width, minlength=num_rows)
+
+        for instruction_name, accumulator in (
+            ("increaseLiquidity", liq_increase_count),
+            ("decreaseLiquidity", liq_decrease_count),
+            ("openPosition", liq_open_count),
+            ("closePosition", liq_close_count),
+            ("resetPositionRange", liq_reset_range_count),
+        ):
+            mask = instructions == instruction_name
+            if np.any(mask):
+                accumulator += np.bincount(row_idx[mask], minlength=num_rows)
+
+    count_denom = np.maximum(liq_event_count, 1.0)
+    return {
+        "liq_event_count": liq_event_count.astype(np.float32, copy=False),
+        "liq_delta_abs_sum": liq_delta_abs_sum.astype(np.float32, copy=False),
+        "liq_delta_net": liq_delta_net.astype(np.float32, copy=False),
+        "liq_increase_count": liq_increase_count.astype(np.float32, copy=False),
+        "liq_decrease_count": liq_decrease_count.astype(np.float32, copy=False),
+        "liq_open_count": liq_open_count.astype(np.float32, copy=False),
+        "liq_close_count": liq_close_count.astype(np.float32, copy=False),
+        "liq_reset_range_count": liq_reset_range_count.astype(np.float32, copy=False),
+        "liq_range_width_mean": (liq_range_width_sum / count_denom).astype(np.float32, copy=False),
+    }, int(total_rows)
+
+
+def load_daily_state_overlay(input_dir, dense_start_time, num_rows):
+    path = os.path.join(input_dir, DAILY_STATE_FILENAME)
+    df = pd.read_parquet(path, columns=["date", "tick_current_index", "liquidity"])
+    if df.empty:
+        raise ValueError(f"No rows found in {path}")
+
+    df["timestamp"] = (
+        pd.to_datetime(df["date"], utc=True).astype("int64") // 1_000_000_000
+    ).astype(np.int64, copy=False)
+    df["tick_current_index"] = pd.to_numeric(df["tick_current_index"], errors="coerce")
+    df["liquidity"] = pd.to_numeric(df["liquidity"], errors="coerce")
+    df = df.sort_values("timestamp").drop_duplicates("timestamp", keep="last").reset_index(drop=True)
+
+    minute_index = pd.Index(
+        np.arange(dense_start_time, dense_start_time + num_rows * BAR_SECONDS, BAR_SECONDS, dtype=np.int64),
+        name="timestamp",
+    )
+    overlay = df.set_index("timestamp").reindex(minute_index, method="ffill")
+
+    daily_tick = overlay["tick_current_index"].to_numpy(dtype=np.float32, copy=True)
+    daily_log_liquidity = np.log1p(np.maximum(overlay["liquidity"].to_numpy(dtype=np.float64, copy=False), 0.0))
+    daily_tick_change_1d = lagged_difference(daily_tick.astype(np.float32, copy=False), 24 * 60)
+    daily_log_liquidity_change_1d = lagged_difference(daily_log_liquidity.astype(np.float32, copy=False), 24 * 60)
+
+    return {
+        "daily_tick_current_index": daily_tick.astype(np.float32, copy=False),
+        "daily_log_liquidity": daily_log_liquidity.astype(np.float32, copy=False),
+        "daily_tick_change_1d": daily_tick_change_1d.astype(np.float32, copy=False),
+        "daily_log_liquidity_change_1d": daily_log_liquidity_change_1d.astype(np.float32, copy=False),
+    }, int(len(df))
 
 
 def build_splits(num_rows, dense_start_time):
@@ -256,6 +491,7 @@ def build_splits(num_rows, dense_start_time):
         raise ValueError("Dataset is too short for the configured lookback, horizon, and features.")
 
     usable_samples = max_sample_end - min_sample_end
+    train_len = max(1, int(usable_samples * TRAIN_WINDOW_RATIO))
     val_len = max(1, int(usable_samples * VAL_RATIO))
     test_len = max(1, int(usable_samples * TEST_RATIO))
 
@@ -263,19 +499,20 @@ def build_splits(num_rows, dense_start_time):
     val_stop = test_start - PURGE_BARS
     val_start = val_stop - val_len
     train_stop = val_start - PURGE_BARS
-    if train_stop <= min_sample_end:
+    train_start = max(min_sample_end, train_stop - train_len)
+    if train_stop <= train_start:
         raise ValueError("Not enough room for train/val/test splits after purge gaps.")
 
     splits = {
-        "train": {"sample_start": int(min_sample_end), "sample_stop": int(train_stop)},
+        "train": {"sample_start": int(train_start), "sample_stop": int(train_stop)},
         "val": {"sample_start": int(val_start), "sample_stop": int(val_stop)},
         "test": {"sample_start": int(test_start), "sample_stop": int(max_sample_end)},
     }
 
     for split_info in splits.values():
         split_info["num_samples"] = int(split_info["sample_stop"] - split_info["sample_start"])
-        split_info["timestamp_start"] = dense_start_time + split_info["sample_start"]
-        split_info["timestamp_stop"] = dense_start_time + split_info["sample_stop"] - 1
+        split_info["timestamp_start"] = dense_start_time + split_info["sample_start"] * BAR_SECONDS
+        split_info["timestamp_stop"] = dense_start_time + (split_info["sample_stop"] - 1) * BAR_SECONDS
 
     fold_len = max(1, (splits["val"]["sample_stop"] - splits["val"]["sample_start"]) // NUM_VAL_FOLDS)
     validation_folds = []
@@ -285,19 +522,20 @@ def build_splits(num_rows, dense_start_time):
             splits["val"]["sample_stop"], fold_start + fold_len
         )
         fold_train_stop = fold_start - PURGE_BARS
-        if fold_train_stop <= min_sample_end:
+        fold_train_start = max(min_sample_end, fold_train_stop - train_len)
+        if fold_train_stop <= fold_train_start:
             break
         validation_folds.append(
             {
                 "fold": fold_idx,
-                "train_start": int(min_sample_end),
+                "train_start": int(fold_train_start),
                 "train_stop": int(fold_train_stop),
                 "val_start": int(fold_start),
                 "val_stop": int(fold_stop),
-                "train_timestamp_start": dense_start_time + int(min_sample_end),
-                "train_timestamp_stop": dense_start_time + int(fold_train_stop) - 1,
-                "val_timestamp_start": dense_start_time + int(fold_start),
-                "val_timestamp_stop": dense_start_time + int(fold_stop) - 1,
+                "train_timestamp_start": dense_start_time + int(fold_train_start) * BAR_SECONDS,
+                "train_timestamp_stop": dense_start_time + (int(fold_train_stop) - 1) * BAR_SECONDS,
+                "val_timestamp_start": dense_start_time + int(fold_start) * BAR_SECONDS,
+                "val_timestamp_stop": dense_start_time + (int(fold_stop) - 1) * BAR_SECONDS,
             }
         )
         fold_start = fold_stop
@@ -318,7 +556,21 @@ def generate_feature_columns(dense_bars):
     close = dense_bars["close"]
     volume = dense_bars["volume"]
     observed = dense_bars["observed"]
-    seconds_since_trade = dense_bars["seconds_since_trade"]
+    minutes_since_observed = dense_bars["minutes_since_observed"]
+    swap_count = np.maximum(dense_bars["swap_count"], 0.0)
+    swap_amount_in_sum = np.maximum(dense_bars["swap_amount_in_sum"], 0.0)
+    swap_amount_out_sum = np.maximum(dense_bars["swap_amount_out_sum"], 0.0)
+    swap_amount_in_mean = np.maximum(dense_bars["swap_amount_in_mean"], 0.0)
+    swap_amount_out_mean = np.maximum(dense_bars["swap_amount_out_mean"], 0.0)
+    swap_amount_in_max = np.maximum(dense_bars["swap_amount_in_max"], 0.0)
+    swap_amount_out_max = np.maximum(dense_bars["swap_amount_out_max"], 0.0)
+    liq_event_count = np.maximum(dense_bars["liq_event_count"], 0.0)
+    liq_delta_abs_sum = np.maximum(dense_bars["liq_delta_abs_sum"], 0.0)
+    liq_increase_count = np.maximum(dense_bars["liq_increase_count"], 0.0)
+    liq_decrease_count = np.maximum(dense_bars["liq_decrease_count"], 0.0)
+    liq_open_count = np.maximum(dense_bars["liq_open_count"], 0.0)
+    liq_close_count = np.maximum(dense_bars["liq_close_count"], 0.0)
+    liq_reset_range_count = np.maximum(dense_bars["liq_reset_range_count"], 0.0)
 
     safe_close = np.maximum(close, EPS)
     safe_open = np.maximum(open_, EPS)
@@ -332,7 +584,7 @@ def generate_feature_columns(dense_bars):
     yield "log_close", log_close
     yield "log_volume", log_volume
     yield "log_return_1", log_return_1
-    yield "log_return_5", lagged_difference(log_close, 5)
+    yield "log_return_3", lagged_difference(log_close, 3)
     yield "log_return_15", lagged_difference(log_close, 15)
     yield "log_return_60", lagged_difference(log_close, 60)
     yield "body_frac", ((close - open_) / safe_open).astype(np.float32)
@@ -340,18 +592,46 @@ def generate_feature_columns(dense_bars):
     yield "upper_wick_frac", ((high - np.maximum(open_, close)) / safe_close).astype(np.float32)
     yield "lower_wick_frac", ((np.minimum(open_, close) - low) / safe_close).astype(np.float32)
 
+    close_sma_15 = rolling_mean(close, 15)
     close_sma_60 = rolling_mean(close, 60)
     close_sma_300 = rolling_mean(close, 300)
+    yield "close_vs_sma_15", ((close / np.maximum(close_sma_15, EPS)) - 1.0).astype(np.float32)
     yield "close_vs_sma_60", ((close / np.maximum(close_sma_60, EPS)) - 1.0).astype(np.float32)
     yield "close_vs_sma_300", ((close / np.maximum(close_sma_300, EPS)) - 1.0).astype(np.float32)
 
+    volume_mean_15 = rolling_mean(log_volume, 15)
+    volume_std_15 = rolling_std(log_volume, 15)
     volume_mean_60 = rolling_mean(log_volume, 60)
     volume_std_60 = rolling_std(log_volume, 60)
+    yield "volume_zscore_15", safe_zscore(log_volume, volume_mean_15, volume_std_15).astype(np.float32)
     yield "volume_zscore_60", safe_zscore(log_volume, volume_mean_60, volume_std_60).astype(np.float32)
+    yield "realized_vol_15", rolling_std(realized_vol_input, 15)
     yield "realized_vol_60", rolling_std(realized_vol_input, 60)
-    yield "realized_vol_300", rolling_std(realized_vol_input, 300)
-    yield "log_seconds_since_trade", np.log1p(seconds_since_trade).astype(np.float32)
+    yield "log_minutes_since_observed", np.log1p(minutes_since_observed).astype(np.float32)
     yield "is_synthetic_bar", (1.0 - observed).astype(np.float32)
+    yield "log_swap_count", np.log1p(swap_count).astype(np.float32)
+    yield "log_swap_amount_in_sum", np.log1p(swap_amount_in_sum).astype(np.float32)
+    yield "log_swap_amount_out_sum", np.log1p(swap_amount_out_sum).astype(np.float32)
+    yield "log_swap_amount_in_mean", np.log1p(swap_amount_in_mean).astype(np.float32)
+    yield "log_swap_amount_out_mean", np.log1p(swap_amount_out_mean).astype(np.float32)
+    yield "log_swap_amount_in_max", np.log1p(swap_amount_in_max).astype(np.float32)
+    yield "log_swap_amount_out_max", np.log1p(swap_amount_out_max).astype(np.float32)
+    yield "swap_tick_delta_sum", dense_bars["swap_tick_delta_sum"].astype(np.float32)
+    yield "swap_tick_delta_abs_sum", dense_bars["swap_tick_delta_abs_sum"].astype(np.float32)
+    yield "swap_tick_delta_max_abs", dense_bars["swap_tick_delta_max_abs"].astype(np.float32)
+    yield "log_liq_event_count", np.log1p(liq_event_count).astype(np.float32)
+    yield "log_liq_delta_abs_sum", np.log1p(liq_delta_abs_sum).astype(np.float32)
+    yield "liq_delta_net", dense_bars["liq_delta_net"].astype(np.float32)
+    yield "log_liq_increase_count", np.log1p(liq_increase_count).astype(np.float32)
+    yield "log_liq_decrease_count", np.log1p(liq_decrease_count).astype(np.float32)
+    yield "log_liq_open_count", np.log1p(liq_open_count).astype(np.float32)
+    yield "log_liq_close_count", np.log1p(liq_close_count).astype(np.float32)
+    yield "log_liq_reset_range_count", np.log1p(liq_reset_range_count).astype(np.float32)
+    yield "liq_range_width_mean", dense_bars["liq_range_width_mean"].astype(np.float32)
+    yield "daily_tick_current_index", dense_bars["daily_tick_current_index"].astype(np.float32)
+    yield "daily_log_liquidity", dense_bars["daily_log_liquidity"].astype(np.float32)
+    yield "daily_tick_change_1d", dense_bars["daily_tick_change_1d"].astype(np.float32)
+    yield "daily_log_liquidity_change_1d", dense_bars["daily_log_liquidity_change_1d"].astype(np.float32)
 
 
 def write_prepared_arrays(dense_bars, splits, output_dir):
@@ -367,7 +647,10 @@ def write_prepared_arrays(dense_bars, splits, output_dir):
     target_memmap[:] = target
     target_memmap.flush()
 
-    scaler_row_start = FEATURE_WARMUP_BARS - 1
+    scaler_row_start = max(
+        FEATURE_WARMUP_BARS - 1,
+        int(splits["train"]["sample_start"]) - LOOKBACK_BARS + 1,
+    )
     scaler_row_stop = splits["train"]["sample_stop"]
 
     feature_names = []
@@ -376,12 +659,12 @@ def write_prepared_arrays(dense_bars, splits, output_dir):
         feature_path, mode="w+", dtype=np.float32, shape=(num_rows, len(FEATURE_NAMES))
     )
     for feature_idx, (name, values) in enumerate(generate_feature_columns(dense_bars)):
-        train_slice = values[scaler_row_start:scaler_row_stop]
+        train_slice = np.asarray(values[scaler_row_start:scaler_row_stop], dtype=np.float64)
         mean = float(np.nanmean(train_slice))
         std = float(np.nanstd(train_slice))
         if not np.isfinite(std) or std < MIN_STD:
             std = 1.0
-        scaled = ((values - mean) / std).astype(np.float32, copy=False)
+        scaled = ((np.asarray(values, dtype=np.float64) - mean) / std).astype(np.float32, copy=False)
         np.nan_to_num(scaled, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
         features_memmap[:, feature_idx] = scaled
         feature_names.append(name)
@@ -398,33 +681,60 @@ def save_metadata(output_dir, metadata):
         json.dump(metadata, f, indent=2, sort_keys=True)
 
 
-def prepare_dataset(input_csv=DEFAULT_INPUT_CSV, output_dir=PREPARED_DIR):
+def prepare_dataset(input_dir=DEFAULT_INPUT_DIR, output_dir=PREPARED_DIR):
     t0 = time.time()
-    if not os.path.exists(input_csv):
-        raise FileNotFoundError(f"Input CSV not found: {input_csv}")
+    validate_input_dir(input_dir)
 
     os.makedirs(output_dir, exist_ok=True)
 
-    raw_times, raw_bars = load_raw_bars(input_csv)
-    dense_bars = densify_bars(raw_times, raw_bars)
+    source_manifest = load_source_manifest(input_dir)
+    dense_bars = load_ohlcv_minutely_bars(input_dir)
+    swap_features, num_swap_rows = aggregate_swaps(
+        input_dir=input_dir,
+        dense_start_time=dense_bars["dense_start_time"],
+        num_rows=len(dense_bars["close"]),
+    )
+    liquidity_features, num_liquidity_event_rows = aggregate_liquidity_events(
+        input_dir=input_dir,
+        dense_start_time=dense_bars["dense_start_time"],
+        num_rows=len(dense_bars["close"]),
+    )
+    daily_features, num_daily_state_rows = load_daily_state_overlay(
+        input_dir=input_dir,
+        dense_start_time=dense_bars["dense_start_time"],
+        num_rows=len(dense_bars["close"]),
+    )
+    dense_bars.update(swap_features)
+    dense_bars.update(liquidity_features)
+    dense_bars.update(daily_features)
+
     num_dense_rows = len(dense_bars["close"])
     splits, validation_folds, min_sample_end, max_sample_end = build_splits(
         num_dense_rows, dense_bars["dense_start_time"]
     )
     feature_names, scaler = write_prepared_arrays(dense_bars, splits, output_dir)
 
+    abs_input_dir = os.path.abspath(input_dir)
+
     metadata = {
-        "version": 1,
-        "input_csv": os.path.abspath(input_csv),
+        "version": PREPARED_VERSION,
+        "source_kind": SOURCE_KIND,
+        "input_dir": abs_input_dir,
         "prepared_dir": os.path.abspath(output_dir),
         "time_budget": TIME_BUDGET,
         "default_time_budget_seconds": TIME_BUDGET,
         "max_time_budget_seconds": MAX_TIME_BUDGET,
         "primary_metric": PRIMARY_METRIC,
         "primary_metric_direction": PRIMARY_METRIC_DIRECTION,
+        "bar_seconds": BAR_SECONDS,
         "lookback_bars": LOOKBACK_BARS,
         "horizon_bars": HORIZON_BARS,
         "purge_bars": PURGE_BARS,
+        "split_strategy": SPLIT_STRATEGY,
+        "train_window_ratio": TRAIN_WINDOW_RATIO,
+        "val_ratio": VAL_RATIO,
+        "test_ratio": TEST_RATIO,
+        "num_val_folds": NUM_VAL_FOLDS,
         "eval_samples": EVAL_SAMPLES,
         "feature_windows": list(FEATURE_WINDOWS),
         "feature_warmup_bars": FEATURE_WARMUP_BARS,
@@ -436,19 +746,37 @@ def prepare_dataset(input_csv=DEFAULT_INPUT_CSV, output_dir=PREPARED_DIR):
         "num_dense_rows": int(num_dense_rows),
         "num_observed_rows": int(np.count_nonzero(dense_bars["observed"])),
         "num_synthetic_rows": int(num_dense_rows - np.count_nonzero(dense_bars["observed"])),
+        "num_swap_rows": int(num_swap_rows),
+        "num_liquidity_event_rows": int(num_liquidity_event_rows),
+        "num_daily_state_rows": int(num_daily_state_rows),
         "sample_end_start": min_sample_end,
         "sample_end_stop": max_sample_end,
         "splits": splits,
         "validation_folds": validation_folds,
+        "source_manifest": source_manifest,
+        "source_files": {
+            METADATA_FILENAME: os.path.join(abs_input_dir, METADATA_FILENAME),
+            OHLCV_FILENAME: os.path.join(abs_input_dir, OHLCV_FILENAME),
+            SWAPS_FILENAME: os.path.join(abs_input_dir, SWAPS_FILENAME),
+            LIQUIDITY_EVENTS_FILENAME: os.path.join(abs_input_dir, LIQUIDITY_EVENTS_FILENAME),
+            DAILY_STATE_FILENAME: os.path.join(abs_input_dir, DAILY_STATE_FILENAME),
+        },
     }
     save_metadata(output_dir, metadata)
 
     elapsed = time.time() - t0
     print(f"Prepared dataset in {elapsed:.1f}s")
-    print(f"Input CSV: {os.path.abspath(input_csv)}")
+    print(f"Input dir: {abs_input_dir}")
     print(f"Prepared dir: {os.path.abspath(output_dir)}")
     print(f"Observed bars: {metadata['num_observed_rows']:,}")
     print(f"Synthetic bars: {metadata['num_synthetic_rows']:,}")
+    print(
+        "Source rows: "
+        f"ohlcv={metadata['num_raw_rows']:,}, "
+        f"swaps={metadata['num_swap_rows']:,}, "
+        f"liquidity_events={metadata['num_liquidity_event_rows']:,}, "
+        f"daily_state={metadata['num_daily_state_rows']:,}"
+    )
     print(f"Features: {len(feature_names)} -> {', '.join(feature_names)}")
     print(summarize_split("train", splits["train"]))
     print(summarize_split("val", splits["val"]))
@@ -537,12 +865,12 @@ def evaluate_regression(model, dataset, split, batch_size, device, autocast_ctx=
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Prepare dense SOL OHLCV features for forecasting.")
+    parser = argparse.ArgumentParser(description="Prepare Orca minute-level features for forecasting.")
     parser.add_argument(
-        "--input-csv",
+        "--input-dir",
         type=str,
-        default=DEFAULT_INPUT_CSV,
-        help="Path to the raw SOL OHLCV CSV.",
+        default=DEFAULT_INPUT_DIR,
+        help="Path to the Orca historical parquet directory.",
     )
     parser.add_argument(
         "--output-dir",
@@ -551,4 +879,4 @@ if __name__ == "__main__":
         help="Directory for prepared arrays and metadata.",
     )
     args = parser.parse_args()
-    prepare_dataset(input_csv=args.input_csv, output_dir=args.output_dir)
+    prepare_dataset(input_dir=args.input_dir, output_dir=args.output_dir)
