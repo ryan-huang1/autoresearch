@@ -39,6 +39,23 @@ To set up a new experiment, work with the user to:
    - Both `results.tsv` and `findings/` must remain untracked by git.
 8. **Confirm and go**: once setup looks correct, start the experiment loop.
 
+## Remote GPU Machine
+
+A remote GPU machine is available for experiments. Prefer that machine over the local CPU machine for heavy data preparation and all real training runs.
+
+Connect with:
+
+- `ssh -i ~/.ssh/tensordock -o IdentitiesOnly=yes user@38.224.253.249`
+
+Operational rules:
+
+- Default execution target for `uv run prepare.py` and `uv run train.py` is the remote GPU machine.
+- Use the local machine mainly for editing, inspection, lightweight checks, and coordination.
+- Use `scp` or `rsync` to transfer the repo, datasets, caches, logs, `results.tsv`, `findings/`, and other experiment artifacts back and forth between the local machine and the remote machine whenever useful.
+- You may install packages, Python environments, CUDA/tooling dependencies, and other machine-local software on the remote machine without asking first.
+- After remote runs, use `scp` or `rsync` to sync the important outputs back so the local repo remains the canonical home for untracked experiment artifacts.
+- This permission does not override repo rules about committed dependency-manifest changes unless a human explicitly asks.
+
 ## Orca Data Inventory
 
 The raw dataset is the entire `orca_hist_last_year/` directory. Use all of it when useful.
@@ -421,7 +438,7 @@ LOOP FOREVER:
 5. If `prepare.py` changed in a way that affects prepared data, rerun:
    - `uv run prepare.py`
 6. Commit the tracked code changes.
-7. Run the experiment:
+7. Run the experiment on the remote GPU machine:
    - Default screen: `uv run train.py > run.log 2>&1`
    - Custom budget run: `uv run train.py --time-budget-seconds <seconds> > run.log 2>&1`
 8. Read out the results from `run.log`:
