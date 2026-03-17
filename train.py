@@ -2,8 +2,8 @@
 Autoresearch Orca minute-level regression with a causal TCN.
 
 Usage:
-    uv run train.py --time-budget-seconds 600
-    uv run train.py --time-budget-seconds 1200
+    uv run train.py --time-budget-seconds 300
+    uv run train.py --time-budget-seconds 3600
 """
 
 from __future__ import annotations
@@ -28,7 +28,6 @@ from prepare import (
     EVAL_SAMPLES,
     HORIZON_BARS,
     LOOKBACK_BARS,
-    MAX_TIME_BUDGET,
     NUM_VAL_FOLDS,
     PREPARED_DIR,
     PREPARED_VERSION,
@@ -321,10 +320,6 @@ def resolve_time_budget_seconds(requested_time_budget_seconds):
     time_budget_seconds = int(requested_time_budget_seconds)
     if time_budget_seconds <= 0:
         raise ValueError("time budget must be positive.")
-    if time_budget_seconds > MAX_TIME_BUDGET:
-        raise ValueError(
-            f"time budget {time_budget_seconds}s exceeds max allowed {MAX_TIME_BUDGET}s."
-        )
     return time_budget_seconds
 
 
@@ -638,10 +633,7 @@ def main():
         "--time-budget-seconds",
         type=int,
         required=True,
-        help=(
-            "Training time budget in seconds. "
-            f"Required for each run, max {MAX_TIME_BUDGET}."
-        ),
+        help="Training time budget in seconds. Required for each run.",
     )
     args = parser.parse_args()
 
@@ -705,7 +697,6 @@ def main():
     print(f"smooth_train_loss: {run_stats['smoothed_train_loss']:.6f}")
     print(f"last_grad_norm:    {run_stats['last_grad_norm']:.6f}")
     print(f"time_budget_s:     {time_budget_seconds}")
-    print(f"max_time_budget_s: {MAX_TIME_BUDGET}")
     print(f"startup_seconds:   {startup_seconds:.1f}")
     print(f"training_seconds:  {run_stats['training_seconds']:.1f}")
     print(f"eval_seconds:      {eval_seconds:.1f}")

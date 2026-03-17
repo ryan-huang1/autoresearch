@@ -3,9 +3,10 @@ One-time data preparation for autoresearch Orca minute-level experiments.
 
 Usage:
     uv run prepare.py
-    uv run prepare.py --input-dir /path/to/orca_hist_last_year
+    uv run prepare.py --output-dir /path/to/prepared_dir
 
-Prepared artifacts are stored under ~/.cache/autoresearch/timeseries by default.
+Prepared artifacts live in AUTORESEARCH_PREPARED_DIR when set, otherwise
+under ~/.cache/autoresearch/timeseries.
 """
 
 from __future__ import annotations
@@ -29,10 +30,10 @@ import torch
 # ---------------------------------------------------------------------------
 
 PREPARED_VERSION = 5
-MAX_TIME_BUDGET = 1_200
 BAR_SECONDS = 60
 DAILY_STATE_LAG_SECONDS = 24 * 60 * 60
 HORIZON_BARS = 3
+PURGE_BARS = 303
 VAL_RATIO = 0.15
 TEST_RATIO = 0.15
 NUM_VAL_FOLDS = 3
@@ -93,9 +94,8 @@ FEATURE_NAMES = (
 LOOKBACK_BARS = 300
 FEATURE_WINDOWS = (15, 60, 300)
 
-# Derived from the benchmark contract plus the current signal settings.
+# Feature warmup depends on the current signal settings.
 FEATURE_WARMUP_BARS = max(FEATURE_WINDOWS)
-PURGE_BARS = LOOKBACK_BARS + HORIZON_BARS
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -716,8 +716,9 @@ def save_metadata(output_dir, metadata):
         json.dump(metadata, f, indent=2, sort_keys=True)
 
 
-def prepare_dataset(input_dir=DEFAULT_INPUT_DIR, output_dir=PREPARED_DIR):
+def prepare_dataset(output_dir=PREPARED_DIR):
     t0 = time.time()
+    input_dir = DEFAULT_INPUT_DIR
     validate_input_dir(input_dir)
 
     os.makedirs(output_dir, exist_ok=True)
@@ -758,7 +759,6 @@ def prepare_dataset(input_dir=DEFAULT_INPUT_DIR, output_dir=PREPARED_DIR):
         "source_kind": SOURCE_KIND,
         "input_dir": abs_input_dir,
         "prepared_dir": os.path.abspath(output_dir),
-        "max_time_budget_seconds": MAX_TIME_BUDGET,
         "primary_metric": PRIMARY_METRIC,
         "primary_metric_direction": PRIMARY_METRIC_DIRECTION,
         "bar_seconds": BAR_SECONDS,
@@ -1063,16 +1063,10 @@ def evaluate_regression(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Prepare Orca minute-level features for forecasting.")
     parser.add_argument(
-        "--input-dir",
-        type=str,
-        default=DEFAULT_INPUT_DIR,
-        help="Path to the Orca historical parquet directory.",
-    )
-    parser.add_argument(
         "--output-dir",
         type=str,
         default=PREPARED_DIR,
         help="Directory for prepared arrays and metadata.",
     )
     args = parser.parse_args()
-    prepare_dataset(input_dir=args.input_dir, output_dir=args.output_dir)
+    prepare_dataset(output_dir=args.output_dir)

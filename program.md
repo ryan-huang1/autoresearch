@@ -31,8 +31,10 @@ To set up a new experiment, work with the user to:
      - `liquidity_events.parquet`
      - `daily_state.parquet`
 6. **Verify prepared artifacts exist**:
-   - Confirm `~/.cache/autoresearch/timeseries/` contains `features.npy`, `targets.npy`, and `metadata.json`.
-   - If they were built from an older benchmark or a different input directory, rerun `uv run prepare.py`.
+   - Confirm the prepared directory for this run contains `features.npy`, `targets.npy`, and `metadata.json`.
+   - By default this is `AUTORESEARCH_PREPARED_DIR` if set, otherwise `~/.cache/autoresearch/timeseries/` on the machine that will run training.
+   - If you override the prepared directory, keep `uv run prepare.py --output-dir <dir>` and `uv run train.py --prepared-dir <dir>` aligned.
+   - If the prepared artifacts were built from older benchmark code, rerun `uv run prepare.py`.
 7. **Initialize local experiment artifacts**:
    - Create `results.tsv` if it does not exist.
    - Ensure `findings/` exists locally.
@@ -240,9 +242,10 @@ These rules are fixed unless a human explicitly changes them:
 - Validation uses walk-forward folds immediately before the test block.
 - Each walk-forward fold trains only on history available before that fold, with purge gaps preserved.
 - `daily_state.parquet` is lagged by one full day before being exposed to the minute grid.
+- The purge gap is fixed separately from lookback.
 - Purge gaps remain part of the split contract.
 - The primary keep/discard metric is **`val_corr`**.
-- The agent chooses the wall-clock training budget for each experiment.
+- The agent chooses the wall-clock training budget for each experiment, with no repo-level maximum cap.
 - In general, prefer shorter runs for faster iteration loops, but run long enough to get reliable results and useful insight.
 - Do not add dependencies or change repo-wide instructions without human approval.
 
@@ -291,14 +294,14 @@ Clarification:
 - The missing-minute fill semantics.
 - The target definition.
 - The chronological split semantics.
-- The purge-gap logic as part of the benchmark contract.
+- The fixed purge gap as part of the benchmark contract.
 - The primary evaluation metric `val_corr`.
 - `program.md`, `README.md`, or `pyproject.toml` unless a human explicitly asks.
 - Dependencies.
 
 ## Goal
 
-The goal is simple: get the **highest `val_corr`** under the configured time budget.
+The goal is simple: get the **highest `val_corr`** at the chosen training budget.
 
 Secondary metrics such as `val_rmse`, `val_mae`, and `val_sign_acc` are for diagnosis and calibration checks. They help you understand *why* a run behaved the way it did, but they do not override the primary keep/discard rule.
 
@@ -306,7 +309,7 @@ Unless there is a clear reason to do otherwise:
 
 - Start with shorter runs so you can complete more iteration loops.
 - Increase the training budget when a stronger signal, a fairer confirmation, or better insight is worth the extra time.
-- When comparing runs, note the configured budget in the findings and `results.tsv` and avoid pretending that short and long runs are directly equivalent.
+- When comparing runs, note the chosen budget in the findings and `results.tsv` and avoid pretending that short and long runs are directly equivalent.
 
 **Simplicity criterion**: all else equal, simpler is better. A tiny improvement that adds brittle complexity is usually not worth keeping. A similarly good or better result with simpler code is a win.
 
@@ -332,7 +335,6 @@ last_train_loss:   0.000456
 smooth_train_loss: 0.000512
 last_grad_norm:    3.142857
 time_budget_s:     600
-max_time_budget_s: 1200
 startup_seconds:   2.1
 training_seconds:  600.0
 eval_seconds:      8.4
@@ -381,7 +383,7 @@ commit	time_budget_s	training_seconds	val_corr	val_rmse	val_mae	val_sign_acc	mem
 Columns:
 
 1. Short git commit hash.
-2. Configured time budget in seconds, such as `600` or `1200`.
+2. Chosen time budget in seconds for that run.
 3. Actual `training_seconds` achieved. Use `0.0` for crashes.
 4. `val_corr` achieved. Higher is better. Use `nan` for crashes.
 5. `val_rmse` achieved. Use `nan` for crashes.
@@ -470,7 +472,7 @@ LOOP FOREVER:
 
 ## Timeout
 
-The agent may choose the training budget for any experiment. In general, prefer shorter runs so you can complete more iteration loops and improve the model faster, but make sure each run is long enough to produce good results and useful insight. Pass `--time-budget-seconds <seconds>` on every training run. If a run goes meaningfully beyond its configured budget and is clearly hung, stop it, log the failure, and move on.
+The agent may choose the training budget for any experiment. There is no repo-level maximum cap. In general, prefer shorter runs so you can complete more iteration loops and improve the model faster, but make sure each run is long enough to produce good results and useful insight. Pass `--time-budget-seconds <seconds>` on every training run. The total budget must still be large enough to allocate at least one second per validation fold. If a run goes meaningfully beyond its chosen budget and is clearly hung, stop it, log the failure, and move on.
 
 Crashes: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
 
