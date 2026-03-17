@@ -47,7 +47,7 @@ A remote GPU machine is available for experiments. Prefer that machine over the 
 
 Connect with:
 
-- `ssh -i ~/.ssh/tensordock -o IdentitiesOnly=yes user@38.224.253.249`
+- `ssh -t -i ~/.ssh/tensordock -o IdentitiesOnly=yes lxiemvzcz3vf5f-644114d8@ssh.runpod.io`
 
 Operational rules:
 
