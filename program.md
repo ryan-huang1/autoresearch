@@ -212,6 +212,7 @@ Important caveats:
 - `ohlcv_minutely.parquet` is the benchmark anchor.
 - `swaps.parquet` and `liquidity_events.parquet` are auxiliary event streams that must be aggregated onto the minute grid.
 - `daily_state.parquet` is a slower regime overlay.
+- `daily_state.parquet` should be treated conservatively: when aligned to the minute grid, lag it by one full day unless snapshot timing is explicitly verified.
 - Raw on-chain numeric fields can be large; robust transforms are encouraged.
 - Sort or group data deterministically before any lagged, rolling, or aggregation logic.
 
@@ -238,6 +239,7 @@ These rules are fixed unless a human explicitly changes them:
 - The newest block remains the untouched anchored final test set.
 - Validation uses walk-forward folds immediately before the test block.
 - Each walk-forward fold trains only on history available before that fold, with purge gaps preserved.
+- `daily_state.parquet` is lagged by one full day before being exposed to the minute grid.
 - Purge gaps remain part of the split contract.
 - The primary keep/discard metric is **`val_corr`**.
 - The agent chooses the wall-clock training budget for each experiment.

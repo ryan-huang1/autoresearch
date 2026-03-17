@@ -23,6 +23,7 @@ import torch.nn.functional as F
 
 from prepare import (
     BAR_SECONDS,
+    DAILY_STATE_LAG_SECONDS,
     DEFAULT_INPUT_DIR,
     EVAL_SAMPLES,
     HORIZON_BARS,
@@ -336,7 +337,10 @@ def validate_prepared_input(dataset):
     actual_horizon_bars = dataset.metadata.get("horizon_bars")
     actual_purge_bars = dataset.metadata.get("purge_bars")
     actual_split_strategy = dataset.metadata.get("split_strategy")
+    actual_daily_state_lag_seconds = dataset.metadata.get("daily_state_lag_seconds")
+    actual_feature_scaling = dataset.metadata.get("feature_scaling")
     actual_num_val_folds = dataset.metadata.get("num_val_folds")
+    actual_train_scaler = dataset.metadata.get("train_scaler")
     actual_validation_folds = dataset.metadata.get("validation_folds") or []
 
     mismatches = []
@@ -364,12 +368,26 @@ def validate_prepared_input(dataset):
         mismatches.append(
             f"split_strategy expected {SPLIT_STRATEGY!r} but found {actual_split_strategy!r}"
         )
+    if actual_daily_state_lag_seconds != DAILY_STATE_LAG_SECONDS:
+        mismatches.append(
+            f"daily_state_lag_seconds expected {DAILY_STATE_LAG_SECONDS} "
+            f"but found {actual_daily_state_lag_seconds!r}"
+        )
+    if actual_feature_scaling != "per_fold_standardize":
+        mismatches.append(
+            f"feature_scaling expected 'per_fold_standardize' but found {actual_feature_scaling!r}"
+        )
     if actual_num_val_folds != NUM_VAL_FOLDS:
         mismatches.append(f"num_val_folds expected {NUM_VAL_FOLDS} but found {actual_num_val_folds!r}")
     if len(actual_validation_folds) != NUM_VAL_FOLDS:
         mismatches.append(
             f"validation_folds expected {NUM_VAL_FOLDS} entries but found {len(actual_validation_folds)!r}"
         )
+    if not actual_train_scaler:
+        mismatches.append("train_scaler metadata is missing.")
+    for fold_idx, fold_info in enumerate(actual_validation_folds):
+        if "scaler" not in fold_info:
+            mismatches.append(f"validation_folds[{fold_idx}] is missing scaler metadata.")
 
     if mismatches:
         details = "\n".join(f"- {item}" for item in mismatches)
@@ -651,6 +669,8 @@ def main():
     print(f"Feature dim: {dataset.input_dim}")
     print(f"Lookback bars: {dataset.metadata['lookback_bars']}")
     print(f"Split strategy: {dataset.metadata['split_strategy']}")
+    print(f"Daily state lag seconds: {dataset.metadata['daily_state_lag_seconds']}")
+    print(f"Feature scaling: {dataset.metadata['feature_scaling']}")
     print(f"Validation folds: {dataset.metadata['num_val_folds']}")
     print(f"Model config: {asdict(model_config)}")
     print(f"Train config: {asdict(train_config)}")

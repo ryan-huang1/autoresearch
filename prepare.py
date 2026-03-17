@@ -28,9 +28,10 @@ import torch
 # Fixed benchmark contract (only change with explicit human approval)
 # ---------------------------------------------------------------------------
 
-PREPARED_VERSION = 4
+PREPARED_VERSION = 5
 MAX_TIME_BUDGET = 1_200
 BAR_SECONDS = 60
+DAILY_STATE_LAG_SECONDS = 24 * 60 * 60
 HORIZON_BARS = 3
 VAL_RATIO = 0.15
 TEST_RATIO = 0.15
@@ -456,9 +457,11 @@ def load_daily_state_overlay(input_dir, dense_start_time, num_rows):
     if df.empty:
         raise ValueError(f"No rows found in {path}")
 
+    # Daily snapshot timing is ambiguous, so expose each row starting on the
+    # following UTC day to keep this overlay strictly causal.
     df["timestamp"] = (
         pd.to_datetime(df["date"], utc=True).astype("int64") // 1_000_000_000
-    ).astype(np.int64, copy=False)
+    ).astype(np.int64, copy=False) + DAILY_STATE_LAG_SECONDS
     df["tick_current_index"] = pd.to_numeric(df["tick_current_index"], errors="coerce")
     df["liquidity"] = pd.to_numeric(df["liquidity"], errors="coerce")
     df = df.sort_values("timestamp").drop_duplicates("timestamp", keep="last").reset_index(drop=True)
@@ -763,6 +766,7 @@ def prepare_dataset(input_dir=DEFAULT_INPUT_DIR, output_dir=PREPARED_DIR):
         "horizon_bars": HORIZON_BARS,
         "purge_bars": PURGE_BARS,
         "split_strategy": SPLIT_STRATEGY,
+        "daily_state_lag_seconds": DAILY_STATE_LAG_SECONDS,
         "val_ratio": VAL_RATIO,
         "test_ratio": TEST_RATIO,
         "num_val_folds": NUM_VAL_FOLDS,
@@ -821,16 +825,34 @@ def prepare_dataset(input_dir=DEFAULT_INPUT_DIR, output_dir=PREPARED_DIR):
 # ---------------------------------------------------------------------------
 
 def scaler_arrays_from_info(scaler_info):
+    if scaler_info is None:
+        raise ValueError("Explicit scaler info is required for causal feature normalization.")
     mean = np.asarray(scaler_info["mean"], dtype=np.float32)
     std = np.asarray(scaler_info["std"], dtype=np.float32)
+    np.nan_to_num(mean, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+    np.nan_to_num(std, copy=False, nan=1.0, posinf=1.0, neginf=1.0)
+    std = np.maximum(np.abs(std), MIN_STD)
     return mean, std
 
 
 def build_window_batch(dataset, endpoints, device, scaler_mean=None, scaler_std=None):
+    if scaler_mean is None or scaler_std is None:
+        raise ValueError(
+            "Explicit scaler_mean and scaler_std are required. "
+            "Use fold scalers for walk-forward validation or the saved train scaler for anchored splits."
+        )
+    scaler_mean = np.asarray(scaler_mean, dtype=np.float32)
+    scaler_std = np.asarray(scaler_std, dtype=np.float32)
+    expected_shape = (dataset.input_dim,)
+    if scaler_mean.shape != expected_shape or scaler_std.shape != expected_shape:
+        raise ValueError(
+            f"Scaler shape mismatch: expected {expected_shape}, "
+            f"got mean={scaler_mean.shape}, std={scaler_std.shape}."
+        )
+    scaler_std = np.maximum(np.abs(scaler_std), MIN_STD)
     row_idx = endpoints[:, None] - dataset.lookback_bars + 1 + dataset.window_offsets[None, :]
     x_np = np.asarray(dataset.features[row_idx], dtype=np.float32)
-    if scaler_mean is not None and scaler_std is not None:
-        x_np = (x_np - scaler_mean[None, None, :]) / scaler_std[None, None, :]
+    x_np = (x_np - scaler_mean[None, None, :]) / scaler_std[None, None, :]
     y_np = np.asarray(dataset.targets[endpoints], dtype=np.float32)
 
     np.nan_to_num(x_np, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
